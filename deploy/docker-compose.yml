@@ -1,0 +1,82 @@
+services:
+  mysql:
+    image: mysql:8.0
+    container_name: zhongji-mysql
+    restart: unless-stopped
+    environment:
+      MYSQL_ROOT_PASSWORD: root_dev
+      MYSQL_DATABASE: zhongji_agent
+      MYSQL_USER: zhongji
+      MYSQL_PASSWORD: zhongji_dev
+    ports:
+      - "3306:3306"
+    volumes:
+      - mysql_data:/var/lib/mysql
+    command:
+      - --character-set-server=utf8mb4
+      - --collation-server=utf8mb4_unicode_ci
+    healthcheck:
+      test: ["CMD", "mysqladmin", "ping", "-h", "127.0.0.1", "-uroot", "-proot_dev"]
+      interval: 10s
+      timeout: 5s
+      retries: 10
+
+  redis:
+    image: redis:7-alpine
+    container_name: zhongji-redis
+    restart: unless-stopped
+    # 宿主机 16379，避免与本机默认 Redis 6379 冲突；容器内仍为 6379
+    ports:
+      - "16379:6379"
+    volumes:
+      - redis_data:/data
+    healthcheck:
+      test: ["CMD", "redis-cli", "ping"]
+      interval: 10s
+      timeout: 3s
+      retries: 10
+
+  # 对话 Stream 异步落库 Worker（与 API 解耦）
+  # 本地开发也可用：poetry run zhongji-chat-worker
+  # 若 MySQL 在宿主机，请将 DATABASE_URL 主机改为 host.docker.internal
+  chat-consumer-worker:
+    build:
+      context: ..
+      dockerfile: deploy/Dockerfile
+    container_name: zhongji-chat-consumer
+    restart: unless-stopped
+    command: ["python", "workers/stream_consumer_main.py"]
+    env_file:
+      - ../.env
+    environment:
+      REDIS_URL: redis://redis:6379/0
+    depends_on:
+      redis:
+        condition: service_healthy
+    extra_hosts:
+      - "host.docker.internal:host-gateway"
+    volumes:
+      - ../:/app
+    working_dir: /app
+    profiles:
+      - workers
+
+  qdrant:
+    image: qdrant/qdrant:v1.12.5
+    container_name: zhongji-qdrant
+    restart: unless-stopped
+    ports:
+      - "6333:6333"   # HTTP / Dashboard
+      - "6334:6334"   # gRPC
+    volumes:
+      - qdrant_data:/qdrant/storage
+    healthcheck:
+      test: ["CMD-SHELL", "bash -c 'exec 3<>/dev/tcp/127.0.0.1/6333'"]
+      interval: 10s
+      timeout: 5s
+      retries: 10
+
+volumes:
+  mysql_data:
+  redis_data:
+  qdrant_data:

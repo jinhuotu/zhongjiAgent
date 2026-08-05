@@ -1,0 +1,50 @@
+# Byte-compiled / cache
+__pycache__/
+*.py[cod]
+*$py.class
+*.so
+.Python
+*.egg-info/
+.eggs/
+dist/
+build/
+*.egg
+
+# Virtual environments
+.venv/
+venv/
+ENV/
+
+# Poetry
+poetry.toml
+
+# Env / secrets
+.env
+.env.local
+*.pem
+
+# IDE
+.idea/
+.vscode/
+*.swp
+.DS_Store
+
+# Tests / coverage / type
+.pytest_cache/
+.mypy_cache/
+.ruff_cache/
+.coverage
+htmlcov/
+
+# Local storage placeholders
+data/
+uploads/
+storage/
+
+# Logs
+*.log
+logs/
+
+# Alembic
+# keep versions; ignore local db dumps
+*.db

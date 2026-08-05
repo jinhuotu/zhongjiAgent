@@ -1,0 +1,85 @@
+[tool.poetry]
+name = "zhongji-agent"
+version = "0.1.0"
+description = "工业燃气车式窑数字化能碳管控平台 - 后端服务（炉境 / LuJing）"
+authors = ["zhongji"]
+readme = "README.md"
+packages = [
+    { include = "common", from = "packages" },
+    { include = "db", from = "packages" },
+    { include = "api", from = "apps" },
+    { include = "ai", from = "apps" },
+    { include = "ingest", from = "apps" },
+    { include = "model_server", from = "apps" },
+    { include = "workers" },
+]
+
+[tool.poetry.dependencies]
+python = "^3.12"
+fastapi = ">=0.115,<1.0"
+uvicorn = { version = ">=0.32,<0.40", extras = ["standard"] }
+pydantic = ">=2.9,<3.0"
+pydantic-settings = ">=2.5,<3.0"
+sqlalchemy = { version = "^2.0", extras = ["asyncio"] }
+asyncmy = "^0.2.9"
+alembic = ">=1.13,<2.0"
+redis = "^5.2"
+httpx = ">=0.27,<1.0"
+sse-starlette = ">=2.1,<3.0"
+python-jose = { version = "^3.3", extras = ["cryptography"] }
+bcrypt = ">=4.0.1"
+python-multipart = "^0.0.20"
+orjson = "^3.10"
+
+# AI 能力层（LangChain 1.x LTS 基线，占位依赖）
+langchain = "1.3.14"
+langchain-core = "1.5.2"
+langgraph = "1.2.10"
+langchain-openai = "1.4.1"
+langchain-text-splitters = "^1.0"
+langchain-qdrant = "^1.0"
+qdrant-client = ">=1.12,<2.0"
+
+# 小模型推理（占位；与 AI 环境后续分镜像）
+onnxruntime = ">=1.19,<1.21"
+apscheduler = "^3.10"
+xlrd = "^2.0.1"
+pymysql = "^1.1.1"
+
+[tool.poetry.group.dev.dependencies]
+ruff = "^0.11"
+mypy = "^1.15"
+pytest = "^8.3"
+pytest-asyncio = "^0.25"
+
+[tool.poetry.scripts]
+zhongji-api = "api.main:run"
+zhongji-ai = "ai.main:run"
+zhongji-ingest = "ingest.main:run"
+zhongji-model = "model_server.main:run"
+zhongji-chat-worker = "workers.stream_consumer_main:main"
+zhongji-dev = "workers.dev_all:main"
+
+[build-system]
+requires = ["poetry-core>=2.0.0"]
+build-backend = "poetry.core.masonry.api"
+
+[tool.ruff]
+line-length = 100
+target-version = "py312"
+src = ["packages", "apps"]
+
+[tool.ruff.lint]
+select = ["E", "F", "I", "UP", "B"]
+
+[tool.mypy]
+python_version = "3.12"
+strict = false
+warn_return_any = true
+warn_unused_ignores = true
+mypy_path = "packages:apps"
+packages = ["common", "db", "api", "ai", "ingest", "model_server"]
+
+[tool.pytest.ini_options]
+asyncio_mode = "auto"
+testpaths = ["tests"]

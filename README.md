@@ -6,6 +6,7 @@ Poetry 单体多模块后端。前端工程：`aizhongjiweb`（默认联调 `htt
 
 - [`docs/开发文档.md`](docs/开发文档.md)
 - [`docs/chat-memory.md`](docs/chat-memory.md)（对话 Redis 热记忆 / Stream 归档）
+- [`docs/生产部署.md`](docs/生产部署.md)（轻量云主机生产部署与排障）
 
 ## 目录结构
 

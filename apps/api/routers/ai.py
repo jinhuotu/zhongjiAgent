@@ -168,9 +168,13 @@ async def ai_chat(body: ChatRequest, db: DbSession, user: CurrentUser) -> EventS
                 role="user",
                 content=user_text,
                 mode=body.mode,
+                knowledge_base_ids=[
+                    str(x).strip()
+                    for x in (body.knowledgeBaseIds or [])
+                    if str(x).strip()
+                ][:32],
             )
             await memory_svc.append_hot_and_enqueue(session=session, message=user_hot)
-            await memory_svc.bump_session_meta(db, session=session, mode=body.mode)
 
             chunks: list[dict[str, Any]] = []
             kb_ids = [
@@ -178,6 +182,12 @@ async def ai_chat(body: ChatRequest, db: DbSession, user: CurrentUser) -> EventS
                 for x in (body.knowledgeBaseIds or [])
                 if str(x).strip()
             ][:32]
+            await memory_svc.bump_session_meta(
+                db,
+                session=session,
+                mode=body.mode,
+                knowledge_base_ids=kb_ids,
+            )
             # 未选知识库 = 不检索；不再支持「开开关却全库扫描」
             use_knowledge = len(kb_ids) > 0
             if use_knowledge:
@@ -263,12 +273,18 @@ async def ai_chat(body: ChatRequest, db: DbSession, user: CurrentUser) -> EventS
                         content=accumulated,
                         mode=body.mode,
                         refs=chunks,
+                        knowledge_base_ids=kb_ids,
                         model_name=getattr(client, "fixed_model", None),
                     )
                     await memory_svc.append_hot_and_enqueue(
                         session=session, message=assistant_hot
                     )
-                    await memory_svc.bump_session_meta(db, session=session, mode=body.mode)
+                    await memory_svc.bump_session_meta(
+                        db,
+                        session=session,
+                        mode=body.mode,
+                        knowledge_base_ids=kb_ids,
+                    )
                     try:
                         await memory_svc.maybe_roll_trim(db, session=session)
                     except Exception as exc:  # noqa: BLE001

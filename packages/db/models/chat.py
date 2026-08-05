@@ -21,6 +21,8 @@ class ChatSession(Base):
     title_auto: Mapped[bool] = mapped_column(Boolean, nullable=False, default=True)
     mode: Mapped[str] = mapped_column(String(16), nullable=False, default="fast")
     summary: Mapped[str | None] = mapped_column(String(512), nullable=True)
+    # 最近一次对话勾选的知识库 public_id 列表（打开历史会话时恢复勾选）
+    knowledge_base_ids: Mapped[list | None] = mapped_column(JSON, nullable=True)
     message_count: Mapped[int] = mapped_column(Integer, nullable=False, default=0)
     last_message_at: Mapped[datetime | None] = mapped_column(DateTime(timezone=True), nullable=True)
     created_at: Mapped[datetime] = mapped_column(

@@ -29,12 +29,14 @@ def to_session_item(
     include_messages: bool = False,
     messages_override: list[dict[str, Any]] | None = None,
 ) -> dict[str, Any]:
+    kb_ids = session.knowledge_base_ids if isinstance(session.knowledge_base_ids, list) else []
     item: dict[str, Any] = {
         "id": session.public_id,
         "title": session.title,
         "titleAuto": bool(session.title_auto),
         "mode": session.mode,
         "summary": session.summary,
+        "knowledgeBaseIds": [str(x) for x in kb_ids if x],
         "messageCount": session.message_count,
         "lastMessageAt": _ts_ms(session.last_message_at),
         "createdAt": _ts_ms(session.created_at),

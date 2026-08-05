@@ -45,6 +45,7 @@ def build_hot_message(
     content: str,
     mode: str | None = None,
     refs: list[dict[str, Any]] | None = None,
+    knowledge_base_ids: list[str] | None = None,
     model_name: str | None = None,
     prompt_tokens: int | None = None,
     completion_tokens: int | None = None,
@@ -58,12 +59,15 @@ def build_hot_message(
     created_at_ms: int | None = None,
 ) -> dict[str, Any]:
     """构造写入 Redis List / Stream 的统一消息结构。"""
+    kb_ids = [str(x) for x in (knowledge_base_ids or []) if x]
     return {
         "id": msg_id or short_msg_id(12),
         "role": role,
         "content": content,
         "mode": mode,
         "refs": refs or [],
+        "knowledgeBaseIds": kb_ids,
+        "useKnowledge": len(kb_ids) > 0,
         "modelName": model_name,
         "promptTokens": prompt_tokens,
         "completionTokens": completion_tokens,
@@ -79,12 +83,17 @@ def build_hot_message(
 
 def hot_message_to_api(msg: dict[str, Any]) -> dict[str, Any]:
     """转为前端会话消息结构。"""
+    kb_ids = msg.get("knowledgeBaseIds") or []
+    if not isinstance(kb_ids, list):
+        kb_ids = []
     return {
         "id": msg.get("id"),
         "role": msg.get("role"),
         "content": msg.get("content") or "",
         "mode": msg.get("mode"),
         "refs": msg.get("refs") or [],
+        "knowledgeBaseIds": [str(x) for x in kb_ids if x],
+        "useKnowledge": bool(msg.get("useKnowledge")) or len(kb_ids) > 0,
         "createdAt": int(msg.get("createdAt") or 0),
         "toolName": msg.get("toolName"),
     }
@@ -246,6 +255,21 @@ def hot_messages_for_llm(messages: list[dict[str, Any]]) -> list[dict[str, str]]
     return out
 
 
+def _kb_ids_from_refs(refs: Any) -> list[str]:
+    if not isinstance(refs, list):
+        return []
+    out: list[str] = []
+    seen: set[str] = set()
+    for r in refs:
+        if not isinstance(r, dict):
+            continue
+        kid = r.get("kb_id") or r.get("kbId")
+        if kid and str(kid) not in seen:
+            seen.add(str(kid))
+            out.append(str(kid))
+    return out
+
+
 async def merge_messages_for_api(
     db: AsyncSession,
     *,
@@ -266,6 +290,8 @@ async def merge_messages_for_api(
             "content": m.content,
             "mode": m.mode,
             "refs": m.refs or [],
+            "knowledgeBaseIds": _kb_ids_from_refs(m.refs),
+            "useKnowledge": bool(m.refs),
             "createdAt": int(m.created_at.timestamp() * 1000) if m.created_at else 0,
             "toolName": m.tool_name,
         }
@@ -286,12 +312,15 @@ async def bump_session_meta(
     *,
     session: ChatSession,
     mode: str | None = None,
+    knowledge_base_ids: list[str] | None = None,
 ) -> None:
     """轻量更新会话元数据（非消息正文），便于侧栏排序；可同步。"""
     session.message_count = int(session.message_count or 0) + 1
     session.last_message_at = datetime.now(timezone.utc)
     if mode in ("fast", "deep"):
         session.mode = mode
+    if knowledge_base_ids is not None:
+        session.knowledge_base_ids = [str(x) for x in knowledge_base_ids if x][:32]
     await db.commit()
     await db.refresh(session)
 

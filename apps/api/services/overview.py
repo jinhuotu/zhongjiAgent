@@ -171,15 +171,40 @@ async def get_overview(
             code = primary["code"]
 
     if primary is None:
+        # 字段形状与有数据时保持一致，避免前端缺字段崩溃
         return {
             "source": "empty",
             "kilnCode": code,
-            "kpis": {},
+            "kilnName": None,
+            "referenceDate": None,
+            "dataRange": None,
+            "kpis": {
+                "dayTce": 0,
+                "dayTceTrend": None,
+                "dayCo2": 0,
+                "dayCo2Trend": None,
+                "avgGasFlow": 0,
+                "avgGasFlowUnit": "m³/h",
+                "avgGasFlowHint": "暂无历史样本",
+                "greenPowerShare": None,
+                "greenPowerHint": "无测点",
+                "sampleCount": 0,
+            },
+            "gauges": {
+                "carbonIntensity": 0,
+                "energyEfficiency": 0,
+                "greenPower": None,
+            },
             "energyTrend24h": [],
             "carbonTrend24h": [],
             "energyMix": [],
             "furnaces": furnaces,
             "alerts": [],
+            "policyCards": {
+                "annualCarbonProgress": None,
+                "efficiencyGrade": None,
+                "ceaSurplus": None,
+            },
             "meta": {"message": "暂无窑炉历史数据，请先导入 Excel"},
         }
 

@@ -79,6 +79,10 @@ class Settings(BaseSettings):
     embedding_model: str = "text-embedding-3-small"
     embedding_dim: int = 1536
     embedding_allow_local_fallback: bool = True
+    # 远端 embeddings 单次 input 条数；过大易被 MaaS 以 400 拒绝
+    embedding_batch_size: int = 8
+    # 单条文本字符上限（防御超长块）；中文手册切块默认 800，此值作兜底
+    embedding_max_chars: int = 6000
 
     qdrant_url: str = "http://127.0.0.1:6333"
     qdrant_api_key: str = ""

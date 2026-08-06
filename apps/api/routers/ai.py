@@ -4,7 +4,7 @@ import asyncio
 import json
 from typing import Any, Literal
 
-from fastapi import APIRouter
+from fastapi import APIRouter, Request
 from pydantic import BaseModel, Field
 from sse_starlette.sse import EventSourceResponse
 
@@ -16,10 +16,15 @@ from api.services.ai.prompts import build_system_prompt
 from api.services.governance import search_for_chat as search_governance
 from api.services.knowledge.ingest import search_chunks
 from api.services.models.runtime import build_llm_client
+from api.services.mcp.runtime import run_chat_with_mcp
 from common.config import get_settings
 from common.errors import AppError, ErrorCode
 from common.logging import get_logger
-from common.redis_tools import check_sliding_rate_limit, session_lock
+from common.redis_tools import (
+    check_sliding_rate_limit,
+    force_release_session_lock,
+    session_lock,
+)
 from common.response import ok
 
 router = APIRouter(prefix="/ai", tags=["ai"])
@@ -41,6 +46,8 @@ class ChatRequest(BaseModel):
     # 兼容旧字段；实际以 knowledgeBaseIds 为准：未选 = 不检索
     useKnowledge: bool = False
     knowledgeBaseIds: list[str] = Field(default_factory=list, max_length=32)
+    # 可选系统提示词 publicId；未传/空 = 不注入管理提示词基座
+    promptId: str | None = Field(default=None, max_length=32)
 
 
 class RelatedRequest(BaseModel):
@@ -121,7 +128,21 @@ async def sessions_update(
 @router.delete("/sessions/{session_id}")
 async def sessions_delete(session_id: str, db: DbSession, user: CurrentUser) -> dict:
     await sessions_svc.delete_session(db, public_id=session_id, user_id=user.id)
+    await force_release_session_lock(session_id)
     return ok({"deleted": True})
+
+
+@router.post("/sessions/{session_id}/cancel")
+async def sessions_cancel(session_id: str, db: DbSession, user: CurrentUser) -> dict:
+    """前端点「停止」时调用：强制释放会话生成锁，便于立即重问。"""
+    await sessions_svc.get_session_for_user(
+        db,
+        public_id=session_id,
+        user_id=user.id,
+        with_messages=False,
+    )
+    released = await force_release_session_lock(session_id)
+    return ok({"cancelled": True, "lockReleased": released})
 
 
 @router.post("/sessions/{session_id}/summarize-title")
@@ -146,7 +167,12 @@ def _extract_user_content(body: ChatRequest) -> str:
 
 
 @router.post("/chat")
-async def ai_chat(body: ChatRequest, db: DbSession, user: CurrentUser) -> EventSourceResponse:
+async def ai_chat(
+    body: ChatRequest,
+    request: Request,
+    db: DbSession,
+    user: CurrentUser,
+) -> EventSourceResponse:
     """SSE 对话：Redis 热窗口 + 限流 + 会话锁 + 滚动裁剪 + 长期记忆召回。"""
     settings = get_settings()
     await check_sliding_rate_limit(scope="chat", subject=str(user.id))
@@ -161,154 +187,260 @@ async def ai_chat(body: ChatRequest, db: DbSession, user: CurrentUser) -> EventS
     )
 
     async def event_generator():  # noqa: ANN202
-        async with session_lock(session.public_id, wait_seconds=20.0):
-            await memory_svc.ensure_hot_context(db, session=session)
-
-            user_hot = memory_svc.build_hot_message(
-                role="user",
-                content=user_text,
-                mode=body.mode,
-                knowledge_base_ids=[
-                    str(x).strip()
-                    for x in (body.knowledgeBaseIds or [])
-                    if str(x).strip()
-                ][:32],
-            )
-            await memory_svc.append_hot_and_enqueue(session=session, message=user_hot)
-
-            chunks: list[dict[str, Any]] = []
-            kb_ids = [
-                str(x).strip()
-                for x in (body.knowledgeBaseIds or [])
-                if str(x).strip()
-            ][:32]
-            await memory_svc.bump_session_meta(
-                db,
-                session=session,
-                mode=body.mode,
-                knowledge_base_ids=kb_ids,
-            )
-            # 未选知识库 = 不检索；不再支持「开开关却全库扫描」
-            use_knowledge = len(kb_ids) > 0
-            if use_knowledge:
-                try:
-                    chunks = await search_chunks(
-                        db,
-                        query=user_text,
-                        top_k=settings.kb_search_top_k,
-                        min_score=settings.kb_search_min_score,
-                        kb_ids=kb_ids,
-                    )
-                except Exception as exc:  # noqa: BLE001
-                    logger.warning("rag search failed: %s", exc)
-                    chunks = []
-
-            gov_refs: list[dict[str, Any]] = []
+        async def _renew_loop(lock: Any) -> None:
+            interval = max(15.0, float(getattr(lock, "ttl", 300) or 300) / 3.0)
             try:
-                gov_refs = await search_governance(db, user_text, top_k=3)
-            except Exception as exc:  # noqa: BLE001
-                logger.warning("governance search failed: %s", exc)
-                gov_refs = []
+                while True:
+                    await asyncio.sleep(interval)
+                    ok = await lock.renew()
+                    if not ok:
+                        logger.warning(
+                            "chat session lock renew failed session=%s",
+                            session.public_id,
+                        )
+                        return
+            except asyncio.CancelledError:
+                raise
 
-            # 长期记忆依赖 Embedding；未选知识库时跳过，避免每次对话多等一轮远程向量
-            long_mem: list[str] = []
-            if use_knowledge:
-                try:
-                    long_mem = await asyncio.wait_for(
-                        recall_long_memory(
-                            db,
-                            user_id=user.id,
-                            query=user_text,
-                            session_id=session.public_id,
-                            top_k=3,
-                        ),
-                        timeout=3.0,
-                    )
-                except asyncio.TimeoutError:
-                    logger.warning("long memory recall timed out (>3s), skip")
-                except Exception as exc:  # noqa: BLE001
-                    logger.warning("long memory recall failed: %s", exc)
-
-            yield {
-                "event": "refs",
-                "data": json.dumps(
-                    {
-                        "mode": body.mode,
-                        "chunks": chunks,
-                        "governance": gov_refs,
-                        "useKnowledge": use_knowledge,
-                        "knowledgeBaseIds": kb_ids,
-                    },
-                    ensure_ascii=False,
-                ),
-            }
-
-            hot_msgs = await memory_svc.load_hot_messages(session.public_id)
-            system_prompt = await build_system_prompt(
-                db,
-                chunks,
-                long_memory=long_mem,
-                use_knowledge=use_knowledge,
-                governance_refs=gov_refs,
-            )
-            llm_messages = [
-                {"role": "system", "content": system_prompt},
-                *memory_svc.hot_messages_for_llm(hot_msgs),
-            ]
-
-            accumulated = ""
+        async def _watch_disconnect() -> None:
+            """客户端点停止/关页时尽快强释锁，避免后续 Failed to fetch / 锁冲突。"""
             try:
-                client = await build_llm_client(db, body.mode)
-                async for text in client.stream_chat(llm_messages, mode=body.mode):
-                    accumulated += text
-                    yield {
-                        "event": "delta",
-                        "data": json.dumps({"text": text}, ensure_ascii=False),
-                    }
+                while True:
+                    if await request.is_disconnected():
+                        logger.info(
+                            "chat client disconnected, force release lock session=%s",
+                            session.public_id,
+                        )
+                        await force_release_session_lock(session.public_id)
+                        return
+                    await asyncio.sleep(0.4)
+            except asyncio.CancelledError:
+                raise
 
-                title: str | None = None
-                if accumulated.strip():
-                    assistant_hot = memory_svc.build_hot_message(
-                        role="assistant",
-                        content=accumulated,
+        disconnect_task: asyncio.Task[None] | None = None
+        try:
+            async with session_lock(session.public_id, wait_seconds=1.0) as lock:
+                renew_task = asyncio.create_task(_renew_loop(lock))
+                disconnect_task = asyncio.create_task(_watch_disconnect())
+                try:
+                    await memory_svc.ensure_hot_context(db, session=session)
+
+                    user_hot = memory_svc.build_hot_message(
+                        role="user",
+                        content=user_text,
                         mode=body.mode,
-                        refs=chunks,
-                        knowledge_base_ids=kb_ids,
-                        model_name=getattr(client, "fixed_model", None),
+                        knowledge_base_ids=[
+                            str(x).strip()
+                            for x in (body.knowledgeBaseIds or [])
+                            if str(x).strip()
+                        ][:32],
                     )
                     await memory_svc.append_hot_and_enqueue(
-                        session=session, message=assistant_hot
+                        session=session, message=user_hot
                     )
+
+                    chunks: list[dict[str, Any]] = []
+                    kb_ids = [
+                        str(x).strip()
+                        for x in (body.knowledgeBaseIds or [])
+                        if str(x).strip()
+                    ][:32]
                     await memory_svc.bump_session_meta(
                         db,
                         session=session,
                         mode=body.mode,
                         knowledge_base_ids=kb_ids,
                     )
-                    try:
-                        await memory_svc.maybe_roll_trim(db, session=session)
-                    except Exception as exc:  # noqa: BLE001
-                        logger.warning("roll trim failed: %s", exc)
-                    title = await sessions_svc.maybe_auto_title(db, session=session)
+                    use_knowledge = len(kb_ids) > 0
+                    if use_knowledge:
+                        try:
+                            chunks = await search_chunks(
+                                db,
+                                query=user_text,
+                                top_k=settings.kb_search_top_k,
+                                min_score=settings.kb_search_min_score,
+                                kb_ids=kb_ids,
+                            )
+                        except Exception as exc:  # noqa: BLE001
+                            logger.warning("rag search failed: %s", exc)
+                            chunks = []
 
-                done_payload: dict[str, Any] = {
-                    "ok": True,
-                    "sessionId": session.public_id,
-                }
-                if title:
-                    done_payload["title"] = title
-                yield {"event": "done", "data": json.dumps(done_payload, ensure_ascii=False)}
-            except AppError as exc:
-                yield {
-                    "event": "error",
-                    "data": json.dumps({"msg": exc.msg}, ensure_ascii=False),
-                }
-            except Exception as exc:  # noqa: BLE001
-                logger.exception("ai chat failed")
-                yield {
-                    "event": "error",
-                    "data": json.dumps({"msg": str(exc)}, ensure_ascii=False),
-                }
+                    gov_refs: list[dict[str, Any]] = []
+                    try:
+                        gov_refs = await search_governance(db, user_text, top_k=3)
+                    except Exception as exc:  # noqa: BLE001
+                        logger.warning("governance search failed: %s", exc)
+                        gov_refs = []
+
+                    long_mem: list[str] = []
+                    if use_knowledge:
+                        try:
+                            long_mem = await asyncio.wait_for(
+                                recall_long_memory(
+                                    db,
+                                    user_id=user.id,
+                                    query=user_text,
+                                    session_id=session.public_id,
+                                    top_k=3,
+                                ),
+                                timeout=3.0,
+                            )
+                        except asyncio.TimeoutError:
+                            logger.warning("long memory recall timed out (>3s), skip")
+                        except Exception as exc:  # noqa: BLE001
+                            logger.warning("long memory recall failed: %s", exc)
+
+                    yield {
+                        "event": "refs",
+                        "data": json.dumps(
+                            {
+                                "mode": body.mode,
+                                "chunks": chunks,
+                                "governance": gov_refs,
+                                "useKnowledge": use_knowledge,
+                                "knowledgeBaseIds": kb_ids,
+                            },
+                            ensure_ascii=False,
+                        ),
+                    }
+
+                    hot_msgs = await memory_svc.load_hot_messages(session.public_id)
+                    base_prompt: str | None = None
+                    prompt_id = (body.promptId or "").strip()
+                    if prompt_id:
+                        from api.services.prompts import configs as prompt_configs
+
+                        base_prompt = await prompt_configs.get_enabled_content(
+                            db, prompt_id
+                        )
+                    system_prompt = await build_system_prompt(
+                        db,
+                        chunks,
+                        base_prompt=base_prompt,
+                        long_memory=long_mem,
+                        use_knowledge=use_knowledge,
+                        governance_refs=gov_refs,
+                    )
+                    llm_messages: list[dict[str, Any]] = []
+                    if system_prompt:
+                        llm_messages.append(
+                            {"role": "system", "content": system_prompt}
+                        )
+                    llm_messages.extend(memory_svc.hot_messages_for_llm(hot_msgs))
+
+                    accumulated = ""
+                    try:
+                        client = await build_llm_client(db, body.mode)
+                        async for ev in run_chat_with_mcp(
+                            db,
+                            client=client,
+                            llm_messages=llm_messages,
+                            mode=body.mode,
+                            session=session,
+                            user_id=user.id,
+                            kb_ids=kb_ids,
+                            chunks=chunks,
+                        ):
+                            if await request.is_disconnected():
+                                logger.info(
+                                    "chat aborted mid-stream session=%s",
+                                    session.public_id,
+                                )
+                                await force_release_session_lock(session.public_id)
+                                return
+                            if ev.get("event") == "__final__":
+                                try:
+                                    final = json.loads(ev.get("data") or "{}")
+                                    accumulated = str(
+                                        final.get("content") or accumulated
+                                    )
+                                except json.JSONDecodeError:
+                                    pass
+                                continue
+                            yield ev
+
+                        title: str | None = None
+                        if accumulated.strip():
+                            assistant_hot = memory_svc.build_hot_message(
+                                role="assistant",
+                                content=accumulated,
+                                mode=body.mode,
+                                refs=chunks,
+                                knowledge_base_ids=kb_ids,
+                                model_name=getattr(client, "fixed_model", None),
+                            )
+                            await memory_svc.append_hot_and_enqueue(
+                                session=session, message=assistant_hot
+                            )
+                            await memory_svc.bump_session_meta(
+                                db,
+                                session=session,
+                                mode=body.mode,
+                                knowledge_base_ids=kb_ids,
+                            )
+                            try:
+                                await memory_svc.maybe_roll_trim(db, session=session)
+                            except Exception as exc:  # noqa: BLE001
+                                logger.warning("roll trim failed: %s", exc)
+                            title = await sessions_svc.maybe_auto_title(
+                                db, session=session
+                            )
+
+                        done_payload: dict[str, Any] = {
+                            "ok": True,
+                            "sessionId": session.public_id,
+                        }
+                        if title:
+                            done_payload["title"] = title
+                        yield {
+                            "event": "done",
+                            "data": json.dumps(done_payload, ensure_ascii=False),
+                        }
+                    except AppError as exc:
+                        yield {
+                            "event": "error",
+                            "data": json.dumps({"msg": exc.msg}, ensure_ascii=False),
+                        }
+                    except asyncio.CancelledError:
+                        await force_release_session_lock(session.public_id)
+                        raise
+                    except Exception as exc:  # noqa: BLE001
+                        logger.exception("ai chat failed")
+                        yield {
+                            "event": "error",
+                            "data": json.dumps({"msg": str(exc)}, ensure_ascii=False),
+                        }
+                finally:
+                    renew_task.cancel()
+                    try:
+                        await renew_task
+                    except asyncio.CancelledError:
+                        pass
+                    except Exception:  # noqa: BLE001
+                        pass
+        except AppError as exc:
+            yield {
+                "event": "error",
+                "data": json.dumps({"msg": exc.msg}, ensure_ascii=False),
+            }
+        except asyncio.CancelledError:
+            await force_release_session_lock(session.public_id)
+            raise
+        except Exception as exc:  # noqa: BLE001
+            logger.exception("ai chat event_generator failed")
+            yield {
+                "event": "error",
+                "data": json.dumps({"msg": str(exc)}, ensure_ascii=False),
+            }
+        finally:
+            if disconnect_task is not None:
+                disconnect_task.cancel()
+                try:
+                    await disconnect_task
+                except asyncio.CancelledError:
+                    pass
+                except Exception:  # noqa: BLE001
+                    pass
 
     return EventSourceResponse(event_generator())
 

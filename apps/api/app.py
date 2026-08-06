@@ -1,6 +1,7 @@
 from fastapi import FastAPI, Request
 from fastapi.middleware.cors import CORSMiddleware
 from fastapi.responses import JSONResponse
+import logging
 
 from api.routers import (
     ai,
@@ -10,9 +11,11 @@ from api.routers import (
     health,
     hot_configs,
     knowledge,
+    mcp_servers,
     models,
     overview,
     production,
+    prompts,
     roles,
     users,
 )
@@ -48,6 +51,15 @@ def create_app() -> FastAPI:
 
     @app.exception_handler(AppError)
     async def app_error_handler(_: Request, exc: AppError) -> JSONResponse:
+        # 5xx 业务错误也落日志，避免「只有浏览器 502、后端像没反应」
+        if exc.status_code >= 500:
+            logging.getLogger("api.app").error(
+                "AppError %s: %s", exc.status_code, exc.msg
+            )
+        elif exc.status_code >= 400:
+            logging.getLogger("api.app").warning(
+                "AppError %s: %s", exc.status_code, exc.msg
+            )
         return JSONResponse(
             status_code=exc.status_code,
             content=fail(exc.code, exc.msg),
@@ -63,6 +75,8 @@ def create_app() -> FastAPI:
     app.include_router(knowledge.router, prefix=settings.api_prefix)
     app.include_router(ai.router, prefix=settings.api_prefix)
     app.include_router(models.router, prefix=settings.api_prefix)
+    app.include_router(mcp_servers.router, prefix=settings.api_prefix)
+    app.include_router(prompts.router, prefix=settings.api_prefix)
     app.include_router(hot_configs.router, prefix=settings.api_prefix)
     app.include_router(furnaces.router, prefix=settings.api_prefix)
     app.include_router(overview.router, prefix=settings.api_prefix)

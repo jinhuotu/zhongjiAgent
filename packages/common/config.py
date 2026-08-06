@@ -47,7 +47,8 @@ class Settings(BaseSettings):
     chat_trim_keep_turns: int = 10
     chat_rate_limit_max: int = 30
     chat_rate_limit_window_seconds: int = 60
-    chat_session_lock_ttl_seconds: int = 120
+    # MCP stdio 启停 + 多轮 tool calling 可能超过 2 分钟；配合续租避免锁提前过期
+    chat_session_lock_ttl_seconds: int = 300
     chat_embed_cache_ttl_seconds: int = 7 * 24 * 3600
     chat_memory_collection: str = "lujing_chat_memory"
     chat_ttl_scan_threshold_seconds: int = 3600

@@ -71,6 +71,15 @@ async def check_sliding_rate_limit(
         )
 
 
+_RENEW_LOCK_LUA = """
+if redis.call('get', KEYS[1]) == ARGV[1] then
+  return redis.call('expire', KEYS[1], tonumber(ARGV[2]))
+else
+  return 0
+end
+"""
+
+
 class SessionLock:
     """单 Redis 实例下的会话互斥锁（集群多 API 实例防并发重复调 LLM）。"""
 
@@ -93,6 +102,18 @@ class SessionLock:
                 return False
             await __import__("asyncio").sleep(0.05)
 
+    async def renew(self) -> bool:
+        """延长锁 TTL；仅当仍由本 token 持有时成功。"""
+        if not self._held:
+            return False
+        redis = get_redis()
+        try:
+            ok = await redis.eval(_RENEW_LOCK_LUA, 1, self.key, self.token, str(int(self.ttl)))
+            return bool(ok)
+        except Exception as exc:  # noqa: BLE001
+            logger.warning("session lock renew failed key=%s: %s", self.key, exc)
+            return False
+
     async def release(self) -> None:
         if not self._held:
             return
@@ -103,22 +124,39 @@ class SessionLock:
             self._held = False
 
 
+async def force_release_session_lock(session_id: str) -> bool:
+    """强制删除会话锁（用户点停止 / 客户端断开时用，不校验 token）。"""
+    sid = (session_id or "").strip()
+    if not sid:
+        return False
+    redis = get_redis()
+    key = f"lock:chat:session:{sid}"
+    try:
+        deleted = await redis.delete(key)
+        if deleted:
+            logger.info("force released chat session lock key=%s", key)
+        return bool(deleted)
+    except Exception as exc:  # noqa: BLE001
+        logger.warning("force release session lock failed key=%s: %s", key, exc)
+        return False
+
+
 @asynccontextmanager
 async def session_lock(
     session_id: str,
     *,
     wait_seconds: float = 15.0,
-) -> AsyncIterator[None]:
+) -> AsyncIterator[SessionLock]:
     lock = SessionLock(session_id)
     acquired = await lock.acquire(wait_seconds=wait_seconds)
     if not acquired:
         raise AppError(
             ErrorCode.CONFLICT,
-            "该会话正在生成回复，请稍后再试",
+            "该会话正在生成回复，请稍后再试（若刚点过停止，请再试一次或新建会话）",
             status_code=409,
         )
     try:
-        yield
+        yield lock
     finally:
         await lock.release()
 

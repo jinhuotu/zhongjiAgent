@@ -7,6 +7,8 @@
   - 仅方便本地联调，内部仍是两个独立子进程
   - 生产 / Docker 请继续分别部署 zhongji-api 与 zhongji-chat-worker
   - Ctrl+C 会同时结束两个子进程
+  - API 在 DEBUG=true 时启用 uvicorn --reload；必须用 -m 启动，
+    不可用 python -c（Windows 下热重载会把进程干掉，zhongji-dev 随之退出）
 """
 
 from __future__ import annotations
@@ -30,12 +32,13 @@ def main() -> None:
     ]
     env["PYTHONPATH"] = sep.join(py_paths + ([env["PYTHONPATH"]] if env.get("PYTHONPATH") else []))
 
-    api_cmd = [sys.executable, "-c", "from api.main import run; run()"]
+    # 使用 -m api.main，保证 uvicorn reload 能正确重启（避免 python -c）
+    api_cmd = [sys.executable, "-m", "api.main"]
     worker_cmd = [sys.executable, str(ROOT / "workers" / "stream_consumer_main.py")]
 
     print("=== zhongji-dev ===")
-    print("API    → api.main:run (:8000)")
-    print("Worker → stream_consumer_main (Stream 归档 + TTL 定时任务)")
+    print("API    → python -m api.main (:8000，DEBUG 时热重载)")
+    print("Worker → stream_consumer_main (Stream 归档 + TTL 定时任务，无热重载)")
     print("Ctrl+C 结束两个进程。\n")
 
     procs: list[subprocess.Popen[bytes]] = []

@@ -96,6 +96,10 @@ def hot_message_to_api(msg: dict[str, Any]) -> dict[str, Any]:
         "useKnowledge": bool(msg.get("useKnowledge")) or len(kb_ids) > 0,
         "createdAt": int(msg.get("createdAt") or 0),
         "toolName": msg.get("toolName"),
+        "toolInput": msg.get("toolInput"),
+        "toolOutput": msg.get("toolOutput"),
+        "toolError": msg.get("toolError"),
+        "toolDurationMs": msg.get("toolDurationMs"),
     }
 
 

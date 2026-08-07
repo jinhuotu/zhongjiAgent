@@ -4,6 +4,7 @@ from fastapi.responses import JSONResponse
 import logging
 
 from api.routers import (
+    agents,
     ai,
     auth,
     furnaces,
@@ -77,6 +78,7 @@ def create_app() -> FastAPI:
     app.include_router(models.router, prefix=settings.api_prefix)
     app.include_router(mcp_servers.router, prefix=settings.api_prefix)
     app.include_router(prompts.router, prefix=settings.api_prefix)
+    app.include_router(agents.router, prefix=settings.api_prefix)
     app.include_router(hot_configs.router, prefix=settings.api_prefix)
     app.include_router(furnaces.router, prefix=settings.api_prefix)
     app.include_router(overview.router, prefix=settings.api_prefix)

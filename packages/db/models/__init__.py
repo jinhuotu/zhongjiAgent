@@ -1,3 +1,4 @@
+from db.models.agent import ScenarioAgent
 from db.models.ai_report import AiReport
 from db.models.chat import ChatMessage, ChatSession
 from db.models.furnace import Furnace, KilnProcessSample
@@ -34,5 +35,6 @@ __all__ = [
     "McpServer",
     "McpTool",
     "Prompt",
+    "ScenarioAgent",
 ]
 

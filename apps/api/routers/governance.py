@@ -1,8 +1,10 @@
 from __future__ import annotations
 
 from typing import Any
+from urllib.parse import quote
 
 from fastapi import APIRouter
+from fastapi.responses import Response
 from pydantic import BaseModel, Field
 
 from api.deps import CurrentUser, DbSession
@@ -100,6 +102,19 @@ async def tasks_excel(task_id: str, body: ExcelPreviewBody, db: DbSession, user:
         content_base64=body.contentBase64,
     )
     return ok({"item": item})
+
+
+@router.get("/tasks/{task_id}/export")
+async def tasks_export(task_id: str, db: DbSession, user: CurrentUser) -> Response:
+    _ = user
+    data, filename, media_type = await gov_svc.export_task_bytes(db, task_id)
+    # RFC 5987 filename* for non-ASCII names
+    disposition = f"attachment; filename*=UTF-8''{quote(filename)}"
+    return Response(
+        content=data,
+        media_type=media_type,
+        headers={"Content-Disposition": disposition},
+    )
 
 
 @router.get("/search")

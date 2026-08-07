@@ -35,6 +35,7 @@ from api.schemas.knowledge import (
 from api.services.knowledge import bases as bases_svc
 
 from api.services.knowledge.ingest import (
+    download_document,
     get_document_preview,
     ingest_text,
     list_documents,
@@ -49,6 +50,10 @@ from common.errors import AppError, ErrorCode
 from common.response import ok
 
 from db.models.knowledge import KnowledgeDocument
+
+from urllib.parse import quote
+
+from fastapi.responses import Response
 
 
 
@@ -444,6 +449,29 @@ async def documents_preview(
     _ = user
     data = await get_document_preview(db, base_public_id=baseId, doc_public_id=public_id)
     return ok(data)
+
+
+@router.get("/documents/{public_id}/download")
+async def documents_download(
+    public_id: str,
+    db: DbSession,
+    user: CurrentUser,
+    baseId: str = Query(..., min_length=1, max_length=32),
+) -> Response:
+    _ = user
+    data, filename, media_type = await download_document(
+        db, base_public_id=baseId, doc_public_id=public_id
+    )
+    disposition = f"attachment; filename*=UTF-8''{quote(filename)}"
+    return Response(
+        content=data,
+        media_type=media_type,
+        headers={
+            "Content-Disposition": disposition,
+            # 便于前端 blob 预览图片时跨域读取
+            "Cache-Control": "private, max-age=60",
+        },
+    )
 
 
 @router.delete("/documents/{public_id}")

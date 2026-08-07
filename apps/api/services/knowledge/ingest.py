@@ -1,6 +1,7 @@
 from __future__ import annotations
 
 import secrets
+from pathlib import Path
 from typing import Any
 
 from sqlalchemy import select
@@ -10,6 +11,7 @@ from api.services.knowledge.bases import get_base_by_public_id
 from api.services.knowledge.chunking import split_text
 from api.services.knowledge.embeddings import get_embedding_client
 from api.services.knowledge.qdrant_store import get_qdrant_store
+from common.config import get_settings
 from common.errors import AppError, ErrorCode
 from db.models.knowledge import KnowledgeDocument
 
@@ -176,6 +178,55 @@ async def get_document_preview(
     }
 
 
+async def download_document(
+    db: AsyncSession,
+    *,
+    base_public_id: str,
+    doc_public_id: str,
+) -> tuple[bytes, str, str]:
+    """优先磁盘原文件；否则导出预览正文为 txt。"""
+    base = await get_base_by_public_id(db, base_public_id)
+    result = await db.execute(
+        select(KnowledgeDocument).where(
+            KnowledgeDocument.public_id == doc_public_id,
+            KnowledgeDocument.base_id == base.id,
+        )
+    )
+    doc = result.scalar_one_or_none()
+    if doc is None:
+        raise AppError(ErrorCode.NOT_FOUND, "document not found", status_code=404)
+
+    key = doc.file_key or doc.storage_path
+    if key:
+        path = Path(get_settings().storage_root) / key
+        if path.is_file():
+            name = path.name or f"{doc.name}.bin"
+            suffix = path.suffix.lower()
+            media = {
+                ".txt": "text/plain; charset=utf-8",
+                ".md": "text/markdown; charset=utf-8",
+                ".csv": "text/csv; charset=utf-8",
+                ".json": "application/json",
+                ".pdf": "application/pdf",
+                ".png": "image/png",
+                ".jpg": "image/jpeg",
+                ".jpeg": "image/jpeg",
+                ".webp": "image/webp",
+                ".gif": "image/gif",
+                ".mp4": "video/mp4",
+            }.get(suffix, "application/octet-stream")
+            return path.read_bytes(), name, media
+
+    preview = await get_document_preview(
+        db, base_public_id=base_public_id, doc_public_id=doc_public_id
+    )
+    content = str(preview.get("content") or doc.summary or doc.name or "")
+    if not content.strip():
+        raise AppError(40402, "文档无可导出内容", status_code=404)
+    filename = f"{doc.name or doc.public_id}.txt".replace("/", "_").replace("\\", "_")
+    return content.encode("utf-8"), filename, "text/plain; charset=utf-8"
+
+
 async def search_chunks(
     db: AsyncSession,
     *,
@@ -185,7 +236,6 @@ async def search_chunks(
     kb_id: str | None = None,
     kb_ids: list[str] | None = None,
 ) -> list[dict[str, Any]]:
-    from common.config import get_settings
     from api.services.knowledge.rerank import hybrid_rerank
 
     q = query.strip()

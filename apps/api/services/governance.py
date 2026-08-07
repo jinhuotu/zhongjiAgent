@@ -164,6 +164,55 @@ async def save_excel_preview(
     return _serialize(row)
 
 
+def _csv_cell(value: Any) -> str:
+    s = "" if value is None else str(value)
+    if any(c in s for c in (",", '"', "\n", "\r")):
+        return '"' + s.replace('"', '""') + '"'
+    return s
+
+
+def build_csv_from_preview(excel: dict[str, Any]) -> bytes:
+    headers = list(excel.get("headers") or [])
+    rows = list(excel.get("rows") or [])
+    lines = [",".join(_csv_cell(h) for h in headers)]
+    for row in rows:
+        cells = list(row or [])
+        width = len(headers) if headers else len(cells)
+        while len(cells) < width:
+            cells.append("")
+        lines.append(",".join(_csv_cell(c) for c in cells[:width]))
+    # utf-8-sig so Excel on Windows opens Chinese correctly
+    return ("\r\n".join(lines) + "\r\n").encode("utf-8-sig")
+
+
+async def export_task_bytes(
+    db: AsyncSession,
+    public_id: str,
+) -> tuple[bytes, str, str]:
+    """返回 (内容, 文件名, media_type)。优先原文件，否则由预览生成 CSV。"""
+    row = await get_task(db, public_id)
+    if row.file_key:
+        path = Path(get_settings().storage_root) / row.file_key
+        if path.is_file():
+            name = path.name or "export.bin"
+            suffix = path.suffix.lower()
+            media = {
+                ".xlsx": "application/vnd.openxmlformats-officedocument.spreadsheetml.sheet",
+                ".xls": "application/vnd.ms-excel",
+                ".csv": "text/csv; charset=utf-8",
+            }.get(suffix, "application/octet-stream")
+            return path.read_bytes(), name, media
+
+    excel = row.excel_preview
+    if not excel or not (excel.get("headers") or excel.get("rows")):
+        raise AppError(40402, "任务尚无可导出的数据", status_code=404)
+
+    raw_name = str(excel.get("fileName") or f"{row.name or 'export'}.csv")
+    stem = Path(raw_name).stem or "export"
+    filename = f"{stem}.csv"
+    return build_csv_from_preview(excel), filename, "text/csv; charset=utf-8"
+
+
 def _tokenize(q: str) -> list[str]:
     """中英混合：空白切分 + 中文 2/3 字片，便于匹配任务名与表头。"""
     q = (q or "").strip().lower()

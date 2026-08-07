@@ -48,6 +48,8 @@ class ChatRequest(BaseModel):
     knowledgeBaseIds: list[str] = Field(default_factory=list, max_length=32)
     # 可选系统提示词 publicId；未传/空 = 不注入管理提示词基座
     promptId: str | None = Field(default=None, max_length=32)
+    # 场景智能体：若传有效 id，则覆盖 mode / promptId / knowledgeBaseIds / 工具策略
+    agentId: str | None = Field(default=None, max_length=32)
 
 
 class RelatedRequest(BaseModel):
@@ -64,6 +66,52 @@ class UpdateSessionRequest(BaseModel):
     title: str | None = Field(default=None, min_length=1, max_length=128)
     mode: Literal["fast", "deep"] | None = None
 
+
+def _normalize_kb_ids(raw: list[str] | None) -> list[str]:
+    return [str(x).strip() for x in (raw or []) if str(x).strip()][:32]
+
+
+async def _resolve_chat_bindings(db: DbSession, body: ChatRequest) -> dict[str, Any]:
+    """解析本轮对话绑定：有 agentId 时以智能体配置为准，否则用请求体字段。"""
+    agent_id = (body.agentId or "").strip() or None
+    if not agent_id:
+        return {
+            "agentId": None,
+            "agentName": None,
+            "mode": body.mode,
+            "promptId": (body.promptId or "").strip() or None,
+            "knowledgeBaseIds": _normalize_kb_ids(body.knowledgeBaseIds),
+            "toolsEnabled": True,
+            "allowedToolIds": None,
+        }
+
+    from api.services.agents import configs as agent_configs
+
+    bundle = await agent_configs.get_enabled_bundle(db, agent_id)
+    mode = bundle.get("mode") if bundle.get("mode") in ("fast", "deep") else "fast"
+    tools_enabled = bool(bundle.get("toolsEnabled", True))
+    mcp_ids = [
+        str(x).strip()
+        for x in (bundle.get("mcpToolIds") or [])
+        if str(x).strip()
+    ][:64]
+    # toolsEnabled=False → 无工具；白名单非空 → 过滤；白名单空 → 不额外限制
+    if not tools_enabled:
+        allowed: list[str] | None = []
+    elif mcp_ids:
+        allowed = mcp_ids
+    else:
+        allowed = None
+
+    return {
+        "agentId": bundle["id"],
+        "agentName": bundle.get("name"),
+        "mode": mode,
+        "promptId": (bundle.get("promptId") or "").strip() or None,
+        "knowledgeBaseIds": _normalize_kb_ids(bundle.get("knowledgeBaseIds") or []),
+        "toolsEnabled": tools_enabled,
+        "allowedToolIds": allowed,
+    }
 
 @router.get("/status")
 async def ai_status(db: DbSession, user: CurrentUser) -> dict:
@@ -176,7 +224,16 @@ async def ai_chat(
     """SSE 对话：Redis 热窗口 + 限流 + 会话锁 + 滚动裁剪 + 长期记忆召回。"""
     settings = get_settings()
     await check_sliding_rate_limit(scope="chat", subject=str(user.id))
-    await build_llm_client(db, body.mode)
+    bindings = await _resolve_chat_bindings(db, body)
+    chat_mode: Literal["fast", "deep"] = bindings["mode"]
+    prompt_id: str | None = bindings["promptId"]
+    kb_ids_bind: list[str] = list(bindings["knowledgeBaseIds"])
+    tools_enabled: bool = bool(bindings["toolsEnabled"])
+    allowed_tool_ids: list[str] | None = bindings["allowedToolIds"]
+    agent_id: str | None = bindings["agentId"]
+    agent_name: str | None = bindings["agentName"]
+
+    await build_llm_client(db, chat_mode)
     user_text = _extract_user_content(body)
 
     session = await sessions_svc.get_session_for_user(
@@ -228,27 +285,19 @@ async def ai_chat(
                     user_hot = memory_svc.build_hot_message(
                         role="user",
                         content=user_text,
-                        mode=body.mode,
-                        knowledge_base_ids=[
-                            str(x).strip()
-                            for x in (body.knowledgeBaseIds or [])
-                            if str(x).strip()
-                        ][:32],
+                        mode=chat_mode,
+                        knowledge_base_ids=list(kb_ids_bind),
                     )
                     await memory_svc.append_hot_and_enqueue(
                         session=session, message=user_hot
                     )
 
                     chunks: list[dict[str, Any]] = []
-                    kb_ids = [
-                        str(x).strip()
-                        for x in (body.knowledgeBaseIds or [])
-                        if str(x).strip()
-                    ][:32]
+                    kb_ids = list(kb_ids_bind)
                     await memory_svc.bump_session_meta(
                         db,
                         session=session,
-                        mode=body.mode,
+                        mode=chat_mode,
                         knowledge_base_ids=kb_ids,
                     )
                     use_knowledge = len(kb_ids) > 0
@@ -290,23 +339,23 @@ async def ai_chat(
                         except Exception as exc:  # noqa: BLE001
                             logger.warning("long memory recall failed: %s", exc)
 
+                    refs_payload: dict[str, Any] = {
+                        "mode": chat_mode,
+                        "chunks": chunks,
+                        "governance": gov_refs,
+                        "useKnowledge": use_knowledge,
+                        "knowledgeBaseIds": kb_ids,
+                    }
+                    if agent_id:
+                        refs_payload["agentId"] = agent_id
+                        refs_payload["agentName"] = agent_name
                     yield {
                         "event": "refs",
-                        "data": json.dumps(
-                            {
-                                "mode": body.mode,
-                                "chunks": chunks,
-                                "governance": gov_refs,
-                                "useKnowledge": use_knowledge,
-                                "knowledgeBaseIds": kb_ids,
-                            },
-                            ensure_ascii=False,
-                        ),
+                        "data": json.dumps(refs_payload, ensure_ascii=False),
                     }
 
                     hot_msgs = await memory_svc.load_hot_messages(session.public_id)
                     base_prompt: str | None = None
-                    prompt_id = (body.promptId or "").strip()
                     if prompt_id:
                         from api.services.prompts import configs as prompt_configs
 
@@ -330,16 +379,18 @@ async def ai_chat(
 
                     accumulated = ""
                     try:
-                        client = await build_llm_client(db, body.mode)
+                        client = await build_llm_client(db, chat_mode)
                         async for ev in run_chat_with_mcp(
                             db,
                             client=client,
                             llm_messages=llm_messages,
-                            mode=body.mode,
+                            mode=chat_mode,
                             session=session,
                             user_id=user.id,
                             kb_ids=kb_ids,
                             chunks=chunks,
+                            tools_enabled=tools_enabled,
+                            allowed_tool_ids=allowed_tool_ids,
                         ):
                             if await request.is_disconnected():
                                 logger.info(
@@ -364,7 +415,7 @@ async def ai_chat(
                             assistant_hot = memory_svc.build_hot_message(
                                 role="assistant",
                                 content=accumulated,
-                                mode=body.mode,
+                                mode=chat_mode,
                                 refs=chunks,
                                 knowledge_base_ids=kb_ids,
                                 model_name=getattr(client, "fixed_model", None),
@@ -375,7 +426,7 @@ async def ai_chat(
                             await memory_svc.bump_session_meta(
                                 db,
                                 session=session,
-                                mode=body.mode,
+                                mode=chat_mode,
                                 knowledge_base_ids=kb_ids,
                             )
                             try:
@@ -392,6 +443,8 @@ async def ai_chat(
                         }
                         if title:
                             done_payload["title"] = title
+                        if agent_id:
+                            done_payload["agentId"] = agent_id
                         yield {
                             "event": "done",
                             "data": json.dumps(done_payload, ensure_ascii=False),

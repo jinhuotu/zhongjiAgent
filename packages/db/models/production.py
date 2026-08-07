@@ -25,19 +25,30 @@ from db.base import Base
 
 class ProdSystem(Base):
     __tablename__ = "prod_systems"
+    __table_args__ = {"comment": "生产侧系统（SCADA）"}
 
-    id: Mapped[int] = mapped_column(BigInteger, primary_key=True, autoincrement=True)
-    code: Mapped[str] = mapped_column(String(32), unique=True, index=True, nullable=False)
-    name: Mapped[str] = mapped_column(String(128), nullable=False)
-    kind: Mapped[str] = mapped_column(String(32), nullable=False)  # tunnel | batching | shuttle_flue
-    description: Mapped[str | None] = mapped_column(String(512), nullable=True)
-    enabled: Mapped[bool] = mapped_column(Boolean, nullable=False, default=True)
-    meta: Mapped[dict | None] = mapped_column(JSON, nullable=True)
+    id: Mapped[int] = mapped_column(
+        BigInteger, primary_key=True, autoincrement=True, comment="主键"
+    )
+    code: Mapped[str] = mapped_column(
+        String(32), unique=True, index=True, nullable=False, comment="系统编码"
+    )
+    name: Mapped[str] = mapped_column(String(128), nullable=False, comment="系统名称")
+    kind: Mapped[str] = mapped_column(
+        String(32), nullable=False, comment="类型：tunnel/batching/shuttle_flue"
+    )  # tunnel | batching | shuttle_flue
+    description: Mapped[str | None] = mapped_column(String(512), nullable=True, comment="说明")
+    enabled: Mapped[bool] = mapped_column(Boolean, nullable=False, default=True, comment="是否启用")
+    meta: Mapped[dict | None] = mapped_column(JSON, nullable=True, comment="扩展元数据JSON")
     created_at: Mapped[datetime] = mapped_column(
-        DateTime(timezone=True), server_default=func.now(), nullable=False
+        DateTime(timezone=True), server_default=func.now(), nullable=False, comment="创建时间"
     )
     updated_at: Mapped[datetime] = mapped_column(
-        DateTime(timezone=True), server_default=func.now(), onupdate=func.now(), nullable=False
+        DateTime(timezone=True),
+        server_default=func.now(),
+        onupdate=func.now(),
+        nullable=False,
+        comment="更新时间",
     )
 
 
@@ -45,20 +56,27 @@ class ProdTag(Base):
     __tablename__ = "prod_tags"
     __table_args__ = (
         UniqueConstraint("system_code", "tag_code", name="uq_prod_tags_system_tag"),
+        {"comment": "生产测点定义"},
     )
 
-    id: Mapped[int] = mapped_column(BigInteger, primary_key=True, autoincrement=True)
-    system_code: Mapped[str] = mapped_column(String(32), nullable=False, index=True)
-    tag_code: Mapped[str] = mapped_column(String(64), nullable=False)
-    name: Mapped[str] = mapped_column(String(128), nullable=False)
-    unit: Mapped[str | None] = mapped_column(String(32), nullable=True)
-    group_name: Mapped[str | None] = mapped_column(String(64), nullable=True)
-    data_type: Mapped[str] = mapped_column(String(16), nullable=False, default="number")
-    writable: Mapped[bool] = mapped_column(Boolean, nullable=False, default=False)
-    alarm_lo: Mapped[float | None] = mapped_column(Float, nullable=True)
-    alarm_hi: Mapped[float | None] = mapped_column(Float, nullable=True)
-    sort_order: Mapped[int] = mapped_column(Integer, nullable=False, default=0)
-    enabled: Mapped[bool] = mapped_column(Boolean, nullable=False, default=True)
+    id: Mapped[int] = mapped_column(
+        BigInteger, primary_key=True, autoincrement=True, comment="主键"
+    )
+    system_code: Mapped[str] = mapped_column(
+        String(32), nullable=False, index=True, comment="系统编码"
+    )
+    tag_code: Mapped[str] = mapped_column(String(64), nullable=False, comment="测点编码")
+    name: Mapped[str] = mapped_column(String(128), nullable=False, comment="测点名称")
+    unit: Mapped[str | None] = mapped_column(String(32), nullable=True, comment="单位")
+    group_name: Mapped[str | None] = mapped_column(String(64), nullable=True, comment="分组")
+    data_type: Mapped[str] = mapped_column(
+        String(16), nullable=False, default="number", comment="数据类型"
+    )
+    writable: Mapped[bool] = mapped_column(Boolean, nullable=False, default=False, comment="是否可写")
+    alarm_lo: Mapped[float | None] = mapped_column(Float, nullable=True, comment="报警下限")
+    alarm_hi: Mapped[float | None] = mapped_column(Float, nullable=True, comment="报警上限")
+    sort_order: Mapped[int] = mapped_column(Integer, nullable=False, default=0, comment="排序")
+    enabled: Mapped[bool] = mapped_column(Boolean, nullable=False, default=True, comment="是否启用")
 
 
 class ProdSample(Base):
@@ -68,53 +86,84 @@ class ProdSample(Base):
     __table_args__ = (
         Index("ix_prod_samples_sys_tag_ts", "system_code", "tag_code", "ts"),
         UniqueConstraint("system_code", "tag_code", "ts", name="uq_prod_samples_sys_tag_ts"),
+        {"comment": "生产测点时序样本"},
     )
 
-    id: Mapped[int] = mapped_column(BigInteger, primary_key=True, autoincrement=True)
-    system_code: Mapped[str] = mapped_column(String(32), nullable=False)
-    tag_code: Mapped[str] = mapped_column(String(64), nullable=False)
-    ts: Mapped[datetime] = mapped_column(DateTime(timezone=False), nullable=False)
-    value_num: Mapped[float | None] = mapped_column(Float, nullable=True)
-    value_text: Mapped[str | None] = mapped_column(String(256), nullable=True)
+    id: Mapped[int] = mapped_column(
+        BigInteger, primary_key=True, autoincrement=True, comment="主键"
+    )
+    system_code: Mapped[str] = mapped_column(String(32), nullable=False, comment="系统编码")
+    tag_code: Mapped[str] = mapped_column(String(64), nullable=False, comment="测点编码")
+    ts: Mapped[datetime] = mapped_column(
+        DateTime(timezone=False), nullable=False, comment="采样时间"
+    )
+    value_num: Mapped[float | None] = mapped_column(Float, nullable=True, comment="数值")
+    value_text: Mapped[str | None] = mapped_column(String(256), nullable=True, comment="文本值")
 
 
 class ProdAlarm(Base):
     __tablename__ = "prod_alarms"
+    __table_args__ = {"comment": "生产报警"}
 
-    id: Mapped[int] = mapped_column(BigInteger, primary_key=True, autoincrement=True)
-    public_id: Mapped[str] = mapped_column(String(32), unique=True, index=True, nullable=False)
-    system_code: Mapped[str] = mapped_column(String(32), nullable=False, index=True)
-    tag_code: Mapped[str | None] = mapped_column(String(64), nullable=True)
-    level: Mapped[str] = mapped_column(String(16), nullable=False, default="warning")
-    title: Mapped[str] = mapped_column(String(256), nullable=False)
-    message: Mapped[str | None] = mapped_column(String(512), nullable=True)
-    status: Mapped[str] = mapped_column(String(16), nullable=False, default="active")  # active|acked|closed
-    raised_at: Mapped[datetime] = mapped_column(DateTime(timezone=True), nullable=False)
-    acked_at: Mapped[datetime | None] = mapped_column(DateTime(timezone=True), nullable=True)
-    closed_at: Mapped[datetime | None] = mapped_column(DateTime(timezone=True), nullable=True)
-    acked_by: Mapped[int | None] = mapped_column(BigInteger, nullable=True)
-    meta: Mapped[dict | None] = mapped_column(JSON, nullable=True)
+    id: Mapped[int] = mapped_column(
+        BigInteger, primary_key=True, autoincrement=True, comment="主键"
+    )
+    public_id: Mapped[str] = mapped_column(
+        String(32), unique=True, index=True, nullable=False, comment="对外ID"
+    )
+    system_code: Mapped[str] = mapped_column(
+        String(32), nullable=False, index=True, comment="系统编码"
+    )
+    tag_code: Mapped[str | None] = mapped_column(String(64), nullable=True, comment="测点编码")
+    level: Mapped[str] = mapped_column(String(16), nullable=False, default="warning", comment="级别")
+    title: Mapped[str] = mapped_column(String(256), nullable=False, comment="标题")
+    message: Mapped[str | None] = mapped_column(String(512), nullable=True, comment="详情")
+    status: Mapped[str] = mapped_column(
+        String(16), nullable=False, default="active", comment="状态：active/acked/closed"
+    )  # active|acked|closed
+    raised_at: Mapped[datetime] = mapped_column(
+        DateTime(timezone=True), nullable=False, comment="产生时间"
+    )
+    acked_at: Mapped[datetime | None] = mapped_column(
+        DateTime(timezone=True), nullable=True, comment="确认时间"
+    )
+    closed_at: Mapped[datetime | None] = mapped_column(
+        DateTime(timezone=True), nullable=True, comment="关闭时间"
+    )
+    acked_by: Mapped[int | None] = mapped_column(BigInteger, nullable=True, comment="确认人用户ID")
+    meta: Mapped[dict | None] = mapped_column(JSON, nullable=True, comment="扩展JSON")
 
 
 class ProdCommand(Base):
     """控制下发：一期模拟执行，执行器接口预留。"""
 
     __tablename__ = "prod_commands"
+    __table_args__ = {"comment": "生产控制指令"}
 
-    id: Mapped[int] = mapped_column(BigInteger, primary_key=True, autoincrement=True)
-    public_id: Mapped[str] = mapped_column(String(32), unique=True, index=True, nullable=False)
-    system_code: Mapped[str] = mapped_column(String(32), nullable=False, index=True)
-    tag_code: Mapped[str] = mapped_column(String(64), nullable=False)
-    action: Mapped[str] = mapped_column(String(32), nullable=False, default="write")
-    target_value: Mapped[float | None] = mapped_column(Float, nullable=True)
-    target_text: Mapped[str | None] = mapped_column(String(256), nullable=True)
-    status: Mapped[str] = mapped_column(
-        String(32), nullable=False, default="pending"
-    )  # pending|simulated|sent|success|failed
-    executor: Mapped[str] = mapped_column(String(32), nullable=False, default="simulate")
-    result_msg: Mapped[str | None] = mapped_column(String(512), nullable=True)
-    requested_by: Mapped[int] = mapped_column(BigInteger, nullable=False)
-    created_at: Mapped[datetime] = mapped_column(
-        DateTime(timezone=True), server_default=func.now(), nullable=False
+    id: Mapped[int] = mapped_column(
+        BigInteger, primary_key=True, autoincrement=True, comment="主键"
     )
-    finished_at: Mapped[datetime | None] = mapped_column(DateTime(timezone=True), nullable=True)
+    public_id: Mapped[str] = mapped_column(
+        String(32), unique=True, index=True, nullable=False, comment="对外ID"
+    )
+    system_code: Mapped[str] = mapped_column(
+        String(32), nullable=False, index=True, comment="系统编码"
+    )
+    tag_code: Mapped[str] = mapped_column(String(64), nullable=False, comment="测点编码")
+    action: Mapped[str] = mapped_column(String(32), nullable=False, default="write", comment="动作")
+    target_value: Mapped[float | None] = mapped_column(Float, nullable=True, comment="目标数值")
+    target_text: Mapped[str | None] = mapped_column(String(256), nullable=True, comment="目标文本")
+    status: Mapped[str] = mapped_column(
+        String(32), nullable=False, default="pending", comment="状态"
+    )  # pending|simulated|sent|success|failed
+    executor: Mapped[str] = mapped_column(
+        String(32), nullable=False, default="simulate", comment="执行器"
+    )
+    result_msg: Mapped[str | None] = mapped_column(String(512), nullable=True, comment="执行结果")
+    requested_by: Mapped[int] = mapped_column(BigInteger, nullable=False, comment="请求人用户ID")
+    created_at: Mapped[datetime] = mapped_column(
+        DateTime(timezone=True), server_default=func.now(), nullable=False, comment="创建时间"
+    )
+    finished_at: Mapped[datetime | None] = mapped_column(
+        DateTime(timezone=True), nullable=True, comment="完成时间"
+    )

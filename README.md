@@ -1,6 +1,6 @@
 # 工业燃气车式窑数字化能碳管控平台 — 后端（zhongji-agent）
 
-Poetry 单体多模块后端。前端工程：`aizhongjiweb`（默认联调 `http://127.0.0.1:8000`）。
+Poetry 单体多模块后端。前端工程：`zhongjivueweb`（Vue 3，默认联调 `http://127.0.0.1:8000`）。
 
 详细现状与接口说明见：
 
@@ -39,6 +39,7 @@ docker compose -f deploy/docker-compose.yml up -d redis qdrant
 
 poetry run python -m alembic upgrade head
 poetry run python scripts/seed_admin.py
+poetry run python scripts/seed_agents.py   # 可选：示例场景智能体
 # 默认管理员：admin / Admin@123456
 ```
 
@@ -59,7 +60,7 @@ poetry run zhongji-chat-worker  # 对话异步归档（测智能问答时必开�
 
 | 命令 | 作用 |
 |---|---|
-| `zhongji-api` | HTTP API：登录、用户/角色、知识库、模型、AI 对话 SSE |
+| `zhongji-api` | HTTP API：登录、用户/角色、知识库、模型、提示词、MCP、场景智能体、AI 对话 SSE |
 | `zhongji-chat-worker` | Redis Stream → MySQL 归档；APScheduler TTL 兜底 |
 | `zhongji-dev` | **仅本地**：同时拉起上面两个子进程；Ctrl+C 一起停 |
 
@@ -71,17 +72,18 @@ Swagger：http://127.0.0.1:8000/docs
 ### 前端
 
 ```powershell
-# aizhongjiweb/.env.local
-NEXT_PUBLIC_API_BASE_URL=http://127.0.0.1:8000
-pnpm dev
+# zhongjivueweb/.env
+VITE_API_BASE_URL=http://127.0.0.1:8000
+npm run dev
 ```
 
-已对接页面：`/login`、`/ai-chat`、`/knowledge`、`/model-manage`、`/users`（管理员）。
+已对接页面（节选）：`/login`、`/ai-chat`、`/scene-agents`、`/prompt-manage`、`/mcp-manage`、`/knowledge`、`/model-manage`、`/users`（管理员）。
 
 ## 已具备能力（摘要）
 
 - JWT 登录 / 用户与角色管理 / 模型管理（DB 配置）
 - 知识库 RAG（MySQL 元数据 + Qdrant）
+- 提示词 / MCP / **场景智能体**（配置包 + 对话 `agentId`）
 - AI 对话：服务端 Redis 窗口上下文 + SSE；异步 Stream 落库
 - 对话 M2：限流、会话锁、Embedding 缓存、滚动裁剪、长期记忆摘要、热配置 Hash、TTL 兜底
 

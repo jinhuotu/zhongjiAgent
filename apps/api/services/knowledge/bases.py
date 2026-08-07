@@ -3,12 +3,15 @@ from __future__ import annotations
 import secrets
 from typing import Any
 
-from sqlalchemy import func, select
+from sqlalchemy import func, or_, select
 from sqlalchemy.ext.asyncio import AsyncSession
 from sqlalchemy.orm import selectinload
 
 from common.errors import AppError, ErrorCode
 from db.models.knowledge import KnowledgeBase, KnowledgeDocument
+
+PURPOSE_RAG = "rag"
+PURPOSE_ASSET = "asset"
 
 
 def short_id(n: int = 12) -> str:
@@ -27,6 +30,7 @@ def to_base_item(base: KnowledgeBase, *, doc_count: int | None = None, chunk_cou
         "id": base.public_id,
         "name": base.name,
         "description": base.description,
+        "purpose": getattr(base, "purpose", None) or PURPOSE_RAG,
         "status": base.status,
         "docCount": doc_count,
         "chunkCount": chunk_count,
@@ -47,13 +51,30 @@ async def get_base_by_public_id(db: AsyncSession, public_id: str) -> KnowledgeBa
     return base
 
 
-async def list_bases(db: AsyncSession) -> list[dict[str, Any]]:
-    result = await db.execute(
+async def list_bases(
+    db: AsyncSession,
+    *,
+    purpose: str | None = PURPOSE_RAG,
+) -> list[dict[str, Any]]:
+    """默认只列 AI 知识库；purpose='asset' 列业务资料库；purpose=None 列全部。"""
+    stmt = (
         select(KnowledgeBase)
         .where(KnowledgeBase.status != "deleted")
         .options(selectinload(KnowledgeBase.documents))
         .order_by(KnowledgeBase.updated_at.desc())
     )
+    if purpose == PURPOSE_RAG:
+        # 兼容未迁移/旧数据：NULL 或 rag
+        stmt = stmt.where(
+            or_(
+                KnowledgeBase.purpose == PURPOSE_RAG,
+                KnowledgeBase.purpose.is_(None),
+            )
+        )
+    elif purpose is not None:
+        stmt = stmt.where(KnowledgeBase.purpose == purpose)
+
+    result = await db.execute(stmt)
     bases = result.scalars().all()
     return [to_base_item(b) for b in bases]
 
@@ -63,15 +84,21 @@ async def create_base(
     *,
     name: str,
     description: str | None = None,
+    purpose: str = PURPOSE_RAG,
     created_by: int | None = None,
+    public_id: str | None = None,
 ) -> dict[str, Any]:
     title = name.strip()
     if not title:
         raise AppError(ErrorCode.VALIDATION, "name is required", status_code=422)
+    p = (purpose or PURPOSE_RAG).strip().lower()
+    if p not in {PURPOSE_RAG, PURPOSE_ASSET}:
+        raise AppError(ErrorCode.VALIDATION, "invalid purpose", status_code=422)
     base = KnowledgeBase(
-        public_id=short_id(12),
+        public_id=(public_id or short_id(12)).strip(),
         name=title,
         description=(description or "").strip() or None,
+        purpose=p,
         status="active",
         created_by=created_by,
     )
@@ -116,3 +143,11 @@ async def count_docs(db: AsyncSession, base_pk: int) -> int:
         select(func.count()).select_from(KnowledgeDocument).where(KnowledgeDocument.base_id == base_pk)
     )
     return int(result.scalar_one() or 0)
+
+
+async def assert_purpose(db: AsyncSession, public_id: str, purpose: str) -> KnowledgeBase:
+    base = await get_base_by_public_id(db, public_id)
+    actual = getattr(base, "purpose", None) or PURPOSE_RAG
+    if actual != purpose:
+        raise AppError(ErrorCode.NOT_FOUND, "knowledge base not found", status_code=404)
+    return base

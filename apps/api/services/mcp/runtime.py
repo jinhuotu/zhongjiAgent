@@ -54,6 +54,22 @@ def to_openai_tools(enabled: list[dict[str, Any]]) -> list[dict[str, Any]]:
     return tools
 
 
+def _filter_enabled_tools(
+    enabled: list[dict[str, Any]],
+    *,
+    tools_enabled: bool = True,
+    allowed_tool_ids: list[str] | None = None,
+) -> list[dict[str, Any]]:
+    """tools_enabled=False → 无工具；allowed_tool_ids 非空 → 白名单；None/空列表且启用 → 不额外限制。"""
+    if not tools_enabled:
+        return []
+    if allowed_tool_ids:
+        allow = {str(x).strip() for x in allowed_tool_ids if str(x).strip()}
+        if allow:
+            return [t for t in enabled if str(t.get("toolId") or "") in allow]
+    return enabled
+
+
 async def run_chat_with_mcp(
     db: AsyncSession,
     *,
@@ -64,17 +80,32 @@ async def run_chat_with_mcp(
     user_id: int,
     kb_ids: list[str],
     chunks: list[dict[str, Any]],  # noqa: ARG001 — 预留 refs 透传
+    tools_enabled: bool = True,
+    allowed_tool_ids: list[str] | None = None,
 ) -> AsyncIterator[dict[str, str]]:
     """带 MCP 工具循环的对话生成器，产出 SSE event dict。
 
     同一轮对话内通过 McpSessionPool 复用 MCP 进程/会话，避免每个 tool 冷启动。
+    allowed_tool_ids：非空时按 mcp_tools.public_id 白名单过滤；空/None 且 tools_enabled
+    为 True 时使用全部已启用工具。
     """
-    enabled = await mcp_svc.list_enabled_tools_for_chat(db)
+    raw_enabled = await mcp_svc.list_enabled_tools_for_chat(db)
+    enabled = _filter_enabled_tools(
+        raw_enabled,
+        tools_enabled=tools_enabled,
+        allowed_tool_ids=allowed_tool_ids,
+    )
     tools = to_openai_tools(enabled)
+    allowed_openai_names = {t["function"]["name"] for t in tools}
     working: list[dict[str, Any]] = [dict(m) for m in llm_messages]
 
     if not tools:
-        logger.info("chat mcp: no enabled tools, plain stream mode=%s", mode)
+        logger.info(
+            "chat mcp: no tools (enabled=%s whitelist=%s), plain stream mode=%s",
+            tools_enabled,
+            bool(allowed_tool_ids),
+            mode,
+        )
         accumulated = ""
         async for text in client.stream_chat(
             [{"role": m["role"], "content": str(m.get("content") or "")} for m in working],
@@ -110,6 +141,7 @@ async def run_chat_with_mcp(
             user_id=user_id,
             kb_ids=kb_ids,
             pool=pool,
+            allowed_openai_names=allowed_openai_names,
         ):
             yield ev
     finally:
@@ -127,6 +159,7 @@ async def _run_tool_loop(
     user_id: int,
     kb_ids: list[str],
     pool: McpSessionPool,
+    allowed_openai_names: set[str] | None = None,
 ) -> AsyncIterator[dict[str, str]]:
     accumulated = ""
 
@@ -230,7 +263,10 @@ async def _run_tool_loop(
             t0 = time.perf_counter()
             tool_error: str | None = None
             tool_content = ""
-            if not parsed:
+            if allowed_openai_names is not None and fn_name not in allowed_openai_names:
+                tool_error = f"tool not allowed for this agent: {fn_name}"
+                tool_content = tool_error
+            elif not parsed:
                 tool_error = f"unknown tool mapping: {fn_name}"
                 tool_content = tool_error
             else:

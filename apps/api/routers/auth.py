@@ -3,6 +3,7 @@ from sqlalchemy import select
 
 from api.deps import CurrentUser, DbSession
 from api.schemas.auth import LoginRequest, RefreshRequest, TokenPair, UserInfo
+from api.services import menus as menus_svc
 from api.services import users as users_svc
 from common.errors import AppError, ErrorCode
 from common.response import ok
@@ -15,6 +16,18 @@ from common.security import (
 from db.models.user import User
 
 router = APIRouter(prefix="/auth", tags=["auth"])
+
+
+def _user_info(user: User) -> UserInfo:
+    return UserInfo(
+        id=user.id,
+        username=user.username,
+        display_name=user.display_name,
+        email=user.email,
+        is_superuser=user.is_superuser,
+        roles=[r.code for r in user.roles],
+        menus=menus_svc.resolve_menus(user),
+    )
 
 
 @router.post("/login")
@@ -32,15 +45,7 @@ async def login(body: LoginRequest, db: DbSession) -> dict:
         access_token=create_access_token(user.username),
         refresh_token=create_refresh_token(user.username),
     )
-    info = UserInfo(
-        id=user.id,
-        username=user.username,
-        display_name=user.display_name,
-        email=user.email,
-        is_superuser=user.is_superuser,
-        roles=[r.code for r in user.roles],
-    )
-    return ok({**tokens.model_dump(), "user": info.model_dump()})
+    return ok({**tokens.model_dump(), "user": _user_info(user).model_dump()})
 
 
 @router.post("/refresh")
@@ -63,12 +68,4 @@ async def refresh(body: RefreshRequest) -> dict:
 
 @router.get("/me")
 async def me(user: CurrentUser) -> dict:
-    info = UserInfo(
-        id=user.id,
-        username=user.username,
-        display_name=user.display_name,
-        email=user.email,
-        is_superuser=user.is_superuser,
-        roles=[r.code for r in user.roles],
-    )
-    return ok(info.model_dump())
+    return ok(_user_info(user).model_dump())

@@ -94,6 +94,8 @@ def to_item(row: AiReport, *, include_content: bool = False) -> dict[str, Any]:
         "size": f"{(row.char_count / 1000):.1f} K 字" if row.char_count else "—",
         "refsCount": len(row.refs or []),
         "errorMsg": row.error_msg,
+        "workflowId": row.workflow_public_id,
+        "workflowRunId": row.workflow_run_id,
         "createdAt": int(row.created_at.timestamp() * 1000) if row.created_at else 0,
         "updatedAt": int(row.updated_at.timestamp() * 1000) if row.updated_at else 0,
     }
@@ -109,6 +111,35 @@ def list_report_types() -> list[dict[str, str]]:
         {"id": k, "name": v["name"], "desc": v["desc"]}
         for k, v in REPORT_TYPES.items()
     ]
+
+
+def build_workflow_input(
+    *,
+    report_type: str,
+    kiln_code: str,
+    kiln_name: str,
+    context_text: str,
+    chunks: list[dict[str, Any]],
+) -> dict[str, Any]:
+    """组装工作流试跑/正式运行的 input（start 节点会写入 context / instruction）。"""
+    type_name = REPORT_TYPES.get(report_type, {}).get("name") or report_type
+    refs = (
+        "\n\n---\n\n".join(
+            f"[#{i + 1} sim={float(c.get('score') or 0):.3f}] {c.get('content')}"
+            for i, c in enumerate(chunks[:5])
+        )
+        if chunks
+        else "（本次未检索到匹配的知识库片段）"
+    )
+    return {
+        "query": f"请生成《{type_name}》，窑炉 {kiln_name}（{kiln_code}）",
+        "contextText": f"{context_text}\n\n【知识库参考片段】\n{refs}",
+        "instruction": TEMPLATES.get(report_type) or "",
+        "systemHint": SYSTEM_BASE,
+        "reportType": report_type,
+        "furnaceId": kiln_code,
+        "furnaceName": kiln_name,
+    }
 
 
 def _fmt(v: Any, unit: str = "") -> str:
@@ -297,6 +328,7 @@ async def create_draft(
     mode: str,
     title: str,
     context_summary: str | None,
+    workflow_public_id: str | None = None,
 ) -> AiReport:
     row = AiReport(
         public_id=short_id(12),
@@ -310,11 +342,25 @@ async def create_draft(
         content=None,
         char_count=0,
         context_summary=(context_summary or "")[:8000] or None,
+        workflow_public_id=(workflow_public_id or None),
+        workflow_run_id=None,
     )
     db.add(row)
     await db.commit()
     await db.refresh(row)
     return row
+
+
+async def attach_workflow_run(
+    db: AsyncSession,
+    *,
+    report: AiReport,
+    workflow_run_id: str,
+) -> AiReport:
+    report.workflow_run_id = (workflow_run_id or "")[:32] or None
+    await db.commit()
+    await db.refresh(report)
+    return report
 
 
 async def finalize_success(
@@ -323,12 +369,15 @@ async def finalize_success(
     report: AiReport,
     content: str,
     refs: list[dict[str, Any]] | None,
+    workflow_run_id: str | None = None,
 ) -> AiReport:
     report.content = content
     report.char_count = len(content)
     report.refs = refs or []
     report.status = "done"
     report.error_msg = None
+    if workflow_run_id:
+        report.workflow_run_id = workflow_run_id[:32]
     await db.commit()
     await db.refresh(report)
     return report

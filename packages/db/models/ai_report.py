@@ -37,6 +37,12 @@ class AiReport(Base):
     refs: Mapped[list | None] = mapped_column(JSON, nullable=True, comment="引用JSON")
     context_summary: Mapped[str | None] = mapped_column(Text, nullable=True, comment="上下文摘要")
     error_msg: Mapped[str | None] = mapped_column(String(512), nullable=True, comment="错误信息")
+    workflow_public_id: Mapped[str | None] = mapped_column(
+        String(32), nullable=True, index=True, comment="绑定的已发布工作流ID"
+    )
+    workflow_run_id: Mapped[str | None] = mapped_column(
+        String(32), nullable=True, comment="本次生成对应的工作流运行ID"
+    )
     created_at: Mapped[datetime] = mapped_column(
         DateTime(timezone=True),
         server_default=func.now(),

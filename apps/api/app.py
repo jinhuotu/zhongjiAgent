@@ -3,9 +3,11 @@ from fastapi.middleware.cors import CORSMiddleware
 from fastapi.responses import JSONResponse
 import logging
 
+from api.middleware import JwtAuthMiddleware
 from api.routers import (
     agents,
     ai,
+    alerts,
     auth,
     furnaces,
     governance,
@@ -17,8 +19,10 @@ from api.routers import (
     overview,
     production,
     prompts,
+    reports,
     roles,
     users,
+    workflows,
 )
 from common import __version__
 from common.config import get_settings
@@ -40,6 +44,8 @@ def create_app() -> FastAPI:
         openapi_url="/openapi.json",
     )
 
+    # 先注册 JWT（内侧），再注册 CORS（外侧），保证 401 响应也带 CORS 头
+    app.add_middleware(JwtAuthMiddleware)
     # CORS: default "*" allows any Origin. For production set CORS_ORIGINS to frontend URLs.
     # With allow_credentials=True, Starlette echoes the request Origin instead of literal "*".
     app.add_middleware(
@@ -84,6 +90,9 @@ def create_app() -> FastAPI:
     app.include_router(overview.router, prefix=settings.api_prefix)
     app.include_router(production.router, prefix=settings.api_prefix)
     app.include_router(governance.router, prefix=settings.api_prefix)
+    app.include_router(alerts.router, prefix=settings.api_prefix)
+    app.include_router(reports.router, prefix=settings.api_prefix)
+    app.include_router(workflows.router, prefix=settings.api_prefix)
 
     return app
 

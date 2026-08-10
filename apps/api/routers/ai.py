@@ -538,6 +538,8 @@ class GenerateReportRequest(BaseModel):
     type: Literal["fault", "forecast", "efficiency", "carbon"]
     furnaceId: str = Field(min_length=1, max_length=32)
     mode: Literal["fast", "deep"] = "deep"
+    # 可选：绑定已发布工作流；空则走内置 RAG+LLM 流水线
+    workflowId: str | None = Field(default=None, max_length=32)
 
 
 @router.get("/reports/types")
@@ -589,12 +591,21 @@ async def reports_generate(
     user: CurrentUser,
 ) -> EventSourceResponse:
     from api.services.ai import reports as reports_svc
+    from api.services.workflows import crud as wf_crud
+    from api.services.workflows import runner as wf_runner
 
     if body.type not in reports_svc.REPORT_TYPES:
         raise AppError(ErrorCode.VALIDATION, "invalid report type", status_code=422)
 
-    # 预检 LLM
-    await build_llm_client(db, body.mode)
+    workflow_id = (body.workflowId or "").strip() or None
+    if workflow_id:
+        wf = await wf_crud.get_by_public_id(db, workflow_id)
+        if not wf.enabled:
+            raise AppError(ErrorCode.VALIDATION, "workflow is disabled", status_code=422)
+        await wf_crud.resolve_run_version(db, wf, use_draft=False)
+    else:
+        # 内置流水线预检 LLM
+        await build_llm_client(db, body.mode)
 
     ctx = await reports_svc.build_context(db, kiln_code=body.furnaceId.strip())
     furnace = ctx["furnace"]
@@ -611,11 +622,13 @@ async def reports_generate(
         mode=body.mode,
         title=title,
         context_summary=ctx["contextText"][:4000],
+        workflow_public_id=workflow_id,
     )
 
     async def event_generator():  # noqa: ANN202
         accumulated = ""
         chunks: list[dict[str, Any]] = []
+        run_id: str | None = None
         try:
             chunks = await reports_svc.search_report_chunks(
                 db,
@@ -633,29 +646,97 @@ async def reports_generate(
                         "mode": body.mode,
                         "refs": len(chunks),
                         "hasSamples": bool(ctx.get("hasSamples")),
+                        "workflowId": workflow_id,
                     },
                     ensure_ascii=False,
                 ),
             }
 
-            messages = reports_svc.build_prompt(
-                report_type=body.type,
-                context_text=ctx["contextText"],
-                chunks=chunks,
-            )
-            client = await build_llm_client(db, body.mode)
-            async for text in client.stream_chat(messages, mode=body.mode):
-                accumulated += text
-                yield {
-                    "event": "delta",
-                    "data": json.dumps({"text": text}, ensure_ascii=False),
-                }
+            if workflow_id:
+                wf_input = reports_svc.build_workflow_input(
+                    report_type=body.type,
+                    kiln_code=body.furnaceId.strip(),
+                    kiln_name=kiln_name,
+                    context_text=ctx["contextText"],
+                    chunks=chunks,
+                )
+                async for ev in wf_runner.run_workflow(
+                    db,
+                    workflow_public_id=workflow_id,
+                    input_data=wf_input,
+                    use_draft=False,
+                    created_by=user.id,
+                    trigger="ai_report",
+                ):
+                    event_name = ev.get("event") or "message"
+                    # 原样转发步骤事件，供前端展示轨迹
+                    if event_name in {"step_start", "step_end"}:
+                        yield ev
+                        try:
+                            payload = json.loads(ev.get("data") or "{}")
+                            if not run_id and payload.get("runId"):
+                                run_id = str(payload["runId"])
+                                await reports_svc.attach_workflow_run(
+                                    db, report=draft, workflow_run_id=run_id
+                                )
+                        except Exception:  # noqa: BLE001
+                            pass
+                        continue
+                    if event_name == "error":
+                        payload = json.loads(ev.get("data") or "{}")
+                        raise AppError(
+                            ErrorCode.INTERNAL,
+                            str(payload.get("msg") or "workflow failed"),
+                            status_code=500,
+                        )
+                    if event_name == "done":
+                        payload = json.loads(ev.get("data") or "{}")
+                        run_id = str(payload.get("runId") or run_id or "") or None
+                        out = payload.get("output")
+                        if isinstance(out, dict):
+                            accumulated = str(
+                                out.get("text") or out.get("output") or ""
+                            )
+                            if not accumulated and out.get("output") is not None:
+                                accumulated = str(out.get("output"))
+                            refs_from_wf = out.get("refs")
+                            if isinstance(refs_from_wf, list) and refs_from_wf:
+                                chunks = refs_from_wf
+                        elif out is not None:
+                            accumulated = str(out)
+                        if not accumulated.strip():
+                            raise AppError(
+                                ErrorCode.INTERNAL,
+                                "workflow finished without output text",
+                                status_code=500,
+                            )
+                        # 一次性推送正文（工作流节点为非流式 complete）
+                        yield {
+                            "event": "delta",
+                            "data": json.dumps(
+                                {"text": accumulated}, ensure_ascii=False
+                            ),
+                        }
+            else:
+                messages = reports_svc.build_prompt(
+                    report_type=body.type,
+                    context_text=ctx["contextText"],
+                    chunks=chunks,
+                )
+                client = await build_llm_client(db, body.mode)
+                async for text in client.stream_chat(messages, mode=body.mode):
+                    accumulated += text
+                    yield {
+                        "event": "delta",
+                        "data": json.dumps({"text": text}, ensure_ascii=False),
+                    }
 
             await reports_svc.finalize_success(
                 db,
                 report=draft,
                 content=accumulated,
                 refs=chunks,
+                workflow_run_id=run_id,
             )
             yield {
                 "event": "done",
@@ -665,24 +746,29 @@ async def reports_generate(
                         "reportId": draft.public_id,
                         "title": title,
                         "charCount": len(accumulated),
+                        "workflowId": workflow_id,
+                        "workflowRunId": run_id,
                     },
                     ensure_ascii=False,
                 ),
             }
         except Exception as exc:  # noqa: BLE001
             logger.exception("ai report generate failed")
+            msg = str(exc)
+            if isinstance(exc, AppError):
+                msg = exc.msg
             try:
                 await reports_svc.finalize_error(
                     db,
                     report=draft,
-                    error_msg=str(exc),
+                    error_msg=msg,
                     content=accumulated,
                 )
             except Exception:  # noqa: BLE001
                 logger.exception("ai report finalize_error failed")
             yield {
                 "event": "error",
-                "data": json.dumps({"msg": str(exc)}, ensure_ascii=False),
+                "data": json.dumps({"msg": msg}, ensure_ascii=False),
             }
 
     return EventSourceResponse(event_generator())

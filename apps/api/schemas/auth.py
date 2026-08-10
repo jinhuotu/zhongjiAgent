@@ -23,3 +23,4 @@ class UserInfo(BaseModel):
     email: str | None = None
     is_superuser: bool = False
     roles: list[str] = Field(default_factory=list)
+    menus: list[str] = Field(default_factory=list, description="可访问菜单 href")

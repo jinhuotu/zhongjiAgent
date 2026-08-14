@@ -22,9 +22,12 @@ def run() -> None:
         reload=settings.debug,
         reload_dirs=reload_dirs,
         # Avoid reload loops when poetry/pip touches site-packages
+        reload_delay=1.0,
         reload_excludes=[
             ".venv/*",
             ".venv\\*",
+            "venv/*",
+            "venv\\*",
             "**/site-packages/**",
             "**/.pytest_cache/**",
             "**/__pycache__/**",

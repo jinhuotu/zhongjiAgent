@@ -1,6 +1,7 @@
 from db.models.agent import ScenarioAgent
 from db.models.ai_report import AiReport
 from db.models.alert import AlertRule
+from db.models.audit import LoginLog, OperationLog
 from db.models.biz_report import BizReport
 from db.models.chat import ChatMessage, ChatSession
 from db.models.furnace import Furnace, KilnProcessSample
@@ -40,6 +41,8 @@ __all__ = [
     "Prompt",
     "ScenarioAgent",
     "AlertRule",
+    "LoginLog",
+    "OperationLog",
     "BizReport",
     "Workflow",
     "WorkflowVersion",

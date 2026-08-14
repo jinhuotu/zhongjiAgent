@@ -22,11 +22,21 @@ MAX_TOOL_ROUNDS = 5
 
 def to_openai_tools(enabled: list[dict[str, Any]]) -> list[dict[str, Any]]:
     tools: list[dict[str, Any]] = []
+    seen_names: set[str] = set()
     for item in enabled:
         schema = item.get("inputSchema") or {"type": "object", "properties": {}}
         if not isinstance(schema, dict):
             schema = {"type": "object", "properties": {}}
         fn_name = openai_tool_name(str(item["serverId"]), str(item["name"]))
+        if fn_name in seen_names:
+            logger.warning(
+                "skip duplicate openai tool name=%s server=%s tool=%s",
+                fn_name,
+                item.get("serverName"),
+                item.get("name"),
+            )
+            continue
+        seen_names.add(fn_name)
         name = str(item.get("name") or "")
         desc = item.get("description") or f"MCP tool {name} from {item.get('serverName')}"
         # 引导模型走默认可达路径，避免 connectionName=default / 盲目 list_databases

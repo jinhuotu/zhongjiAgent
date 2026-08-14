@@ -1,14 +1,18 @@
+from contextlib import asynccontextmanager
+
 from fastapi import FastAPI, Request
 from fastapi.middleware.cors import CORSMiddleware
 from fastapi.responses import JSONResponse
 import logging
 
-from api.middleware import JwtAuthMiddleware
+from api.middleware import JwtAuthMiddleware, OperationLogMiddleware
 from api.routers import (
     agents,
     ai,
     alerts,
+    audit,
     auth,
+    casting,
     furnaces,
     governance,
     health,
@@ -31,6 +35,22 @@ from common.logging import setup_logging
 from common.response import fail
 
 
+@asynccontextmanager
+async def _lifespan(_app: FastAPI):
+    try:
+        from api.services import audit as audit_svc
+
+        deleted = await audit_svc.purge_expired_logs()
+        logging.getLogger("api.app").info(
+            "audit purge on startup operations=%s logins=%s",
+            deleted.get("operations", 0),
+            deleted.get("logins", 0),
+        )
+    except Exception:  # noqa: BLE001
+        logging.getLogger("api.app").exception("audit purge on startup failed")
+    yield
+
+
 def create_app() -> FastAPI:
     settings = get_settings()
     setup_logging("DEBUG" if settings.debug else "INFO")
@@ -42,10 +62,12 @@ def create_app() -> FastAPI:
         docs_url="/docs",
         redoc_url="/redoc",
         openapi_url="/openapi.json",
+        lifespan=_lifespan,
     )
 
-    # 先注册 JWT（内侧），再注册 CORS（外侧），保证 401 响应也带 CORS 头
+    # 先注册 JWT（内侧），再注册操作日志，最后 CORS（外侧），保证 401 响应也带 CORS 头
     app.add_middleware(JwtAuthMiddleware)
+    app.add_middleware(OperationLogMiddleware)
     # CORS: default "*" allows any Origin. For production set CORS_ORIGINS to frontend URLs.
     # With allow_credentials=True, Starlette echoes the request Origin instead of literal "*".
     app.add_middleware(
@@ -79,6 +101,7 @@ def create_app() -> FastAPI:
     app.include_router(auth.router, prefix=settings.api_prefix)
     app.include_router(users.router, prefix=settings.api_prefix)
     app.include_router(roles.router, prefix=settings.api_prefix)
+    app.include_router(audit.router, prefix=settings.api_prefix)
     app.include_router(knowledge.router, prefix=settings.api_prefix)
     app.include_router(ai.router, prefix=settings.api_prefix)
     app.include_router(models.router, prefix=settings.api_prefix)
@@ -93,6 +116,7 @@ def create_app() -> FastAPI:
     app.include_router(alerts.router, prefix=settings.api_prefix)
     app.include_router(reports.router, prefix=settings.api_prefix)
     app.include_router(workflows.router, prefix=settings.api_prefix)
+    app.include_router(casting.router, prefix=settings.api_prefix)
 
     return app
 

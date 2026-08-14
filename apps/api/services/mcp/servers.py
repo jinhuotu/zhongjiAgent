@@ -339,7 +339,29 @@ async def _replace_tools(
     server: McpServer,
     tools: list[McpToolDef],
 ) -> None:
-    existing = {t.name: t for t in (server.tools or [])}
+    # 不要用 server.tools 关系：expire_on_commit=False 时集合可能过期，
+    # 连续 health + refresh 会把同名工具再插入一行，对话侧报 Tool names must be unique。
+    rows = list(
+        (
+            await db.execute(select(McpTool).where(McpTool.server_id == server.id))
+        ).scalars().all()
+    )
+    existing: dict[str, McpTool] = {}
+    for row in rows:
+        prev = existing.get(row.name)
+        if prev is None:
+            existing[row.name] = row
+            continue
+        keep, drop = (prev, row) if prev.id <= row.id else (row, prev)
+        existing[row.name] = keep
+        await db.delete(drop)
+        logger.warning(
+            "mcp drop duplicate tool server=%s name=%s dropped=%s kept=%s",
+            server.public_id,
+            row.name,
+            drop.public_id,
+            keep.public_id,
+        )
     seen: set[str] = set()
     for td in tools:
         seen.add(td.name)
@@ -476,10 +498,21 @@ async def list_enabled_tools_for_chat(db: AsyncSession) -> list[dict[str, Any]]:
         .order_by(McpServer.updated_at.desc())
     )
     out: list[dict[str, Any]] = []
+    seen_keys: set[tuple[str, str]] = set()
     for server in result.scalars().unique().all():
         for tool in server.tools or []:
             if not tool.enabled:
                 continue
+            key = (server.public_id, tool.name)
+            if key in seen_keys:
+                logger.warning(
+                    "skip duplicate mcp tool row server=%s name=%s toolId=%s",
+                    server.public_id,
+                    tool.name,
+                    tool.public_id,
+                )
+                continue
+            seen_keys.add(key)
             out.append(
                 {
                     "serverId": server.public_id,
@@ -520,6 +553,7 @@ async def call_tool_on_server(
     tool_name: str,
     arguments: dict[str, Any] | None = None,
     pool: Any | None = None,
+    timeout_seconds: float | None = None,
 ) -> dict[str, Any]:
     server = await get_by_public_id(db, server_public_id)
     if not server.enabled:
@@ -527,8 +561,11 @@ async def call_tool_on_server(
     tool = next((t for t in (server.tools or []) if t.name == tool_name), None)
     if tool is not None and not tool.enabled:
         raise AppError(ErrorCode.FORBIDDEN, "mcp tool disabled", status_code=403)
-    # 对话超时过长（如 180s）时 list_databases 会空等很久；单次工具调用封顶 45s 更快失败
-    chat_timeout = min(float(server.timeout_seconds or 60), 45.0)
+    # 对话默认封顶 45s，避免 list_databases 空等；长查询可传 timeout_seconds
+    if timeout_seconds is not None:
+        chat_timeout = max(5.0, float(timeout_seconds))
+    else:
+        chat_timeout = min(float(server.timeout_seconds or 60), 45.0)
     client = _build_client(server, timeout_seconds=chat_timeout)
     safe_args = _sanitize_mssql_tool_args(tool_name, arguments or {})
     if pool is not None:

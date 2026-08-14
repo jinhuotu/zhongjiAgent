@@ -9,6 +9,8 @@
   - Ctrl+C 会同时结束两个子进程
   - API 在 DEBUG=true 时启用 uvicorn --reload；必须用 -m 启动，
     不可用 python -c（Windows 下热重载会把进程干掉，zhongji-dev 随之退出）
+  - Windows 下子进程使用 CREATE_NEW_PROCESS_GROUP：WatchFiles 热重载会向
+    控制台进程组广播 CTRL_C_EVENT，不隔离时会把 zhongji-dev + Worker 一起杀掉
 """
 
 from __future__ import annotations
@@ -20,6 +22,12 @@ import time
 from pathlib import Path
 
 ROOT = Path(__file__).resolve().parents[1]
+
+
+def _popen_kwargs() -> dict:
+    if sys.platform != "win32":
+        return {}
+    return {"creationflags": subprocess.CREATE_NEW_PROCESS_GROUP}
 
 
 def main() -> None:
@@ -42,10 +50,11 @@ def main() -> None:
     print("Ctrl+C 结束两个进程。\n")
 
     procs: list[subprocess.Popen[bytes]] = []
+    popen_kw = _popen_kwargs()
     try:
-        procs.append(subprocess.Popen(api_cmd, cwd=str(ROOT), env=env))
+        procs.append(subprocess.Popen(api_cmd, cwd=str(ROOT), env=env, **popen_kw))
         time.sleep(0.8)
-        procs.append(subprocess.Popen(worker_cmd, cwd=str(ROOT), env=env))
+        procs.append(subprocess.Popen(worker_cmd, cwd=str(ROOT), env=env, **popen_kw))
 
         while True:
             for p in procs:

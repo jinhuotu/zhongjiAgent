@@ -90,6 +90,140 @@ def _find_node() -> str | None:
     return shutil.which("node.exe") or shutil.which("node")
 
 
+def _project_root() -> Path:
+    """仓库根目录：优先环境变量 / Settings，否则从本文件向上探测 scripts/。"""
+    for key in ("ZHONGJI_ROOT", "MCP_PROJECT_ROOT", "PROJECT_ROOT"):
+        raw = (os.environ.get(key) or "").strip()
+        if not raw:
+            continue
+        p = Path(raw).expanduser().resolve()
+        if p.is_dir():
+            return p
+    try:
+        from common.config import get_settings
+
+        configured = (get_settings().zhongji_root or "").strip()
+        if configured:
+            p = Path(configured).expanduser().resolve()
+            if p.is_dir():
+                return p
+    except Exception:  # noqa: BLE001
+        pass
+    here = Path(__file__).resolve()
+    # apps/api/services/mcp/client.py → parents[4] = repo root
+    for parent in [here.parents[4], *here.parents]:
+        if (parent / "scripts" / "mcp_utility_server.py").is_file():
+            return parent
+    return here.parents[4]
+
+
+_PYTHON_COMMAND_ALIASES = {
+    "python",
+    "python3",
+    "python.exe",
+    "python3.exe",
+    "py",
+    "py.exe",
+    "${python}",
+    "${PYTHON}",
+    "${sys.executable}",
+    "${SYS_EXECUTABLE}",
+}
+
+
+def _expand_placeholders(text: str, *, root: Path) -> str:
+    """展开 ${PYTHON} / ${ZHONGJI_ROOT} 等；其余回退 os.environ。"""
+    mapping = {
+        "PYTHON": sys.executable,
+        "SYS_EXECUTABLE": sys.executable,
+        "ZHONGJI_ROOT": str(root),
+        "MCP_PROJECT_ROOT": str(root),
+        "PROJECT_ROOT": str(root),
+    }
+
+    def _repl(match: re.Match[str]) -> str:
+        key = match.group(1)
+        if key in mapping:
+            return mapping[key]
+        return os.environ.get(key, match.group(0))
+
+    return re.sub(r"\$\{([A-Za-z_][A-Za-z0-9_]*)\}", _repl, text)
+
+
+def _is_python_command(command: str) -> bool:
+    raw = (command or "").strip()
+    if not raw:
+        return False
+    if raw.lower() in _PYTHON_COMMAND_ALIASES:
+        return True
+    base = os.path.basename(raw).lower()
+    return base in {
+        "python",
+        "python3",
+        "python.exe",
+        "python3.exe",
+        "py",
+        "py.exe",
+    }
+
+
+def _looks_like_filesystem_arg(value: str) -> bool:
+    """仅对像路径的参数做仓库相对解析；npx 的 -y / 包名等保持原样。"""
+    text = (value or "").strip()
+    if not text:
+        return False
+    if text.startswith("-"):
+        return False
+    # npm scoped 包名（@scope/name）含 "/"，不能当仓库相对路径
+    if text.startswith("@") and "\\" not in text:
+        return False
+    if text.startswith("${"):
+        return True
+    lower = text.lower()
+    if lower.endswith((".py", ".js", ".mjs", ".cjs", ".ts", ".json", ".exe", ".cmd", ".bat")):
+        return True
+    if "/" in text or "\\" in text:
+        return True
+    if text.startswith(".") or text.startswith("~"):
+        return True
+    return False
+
+
+def _resolve_stdio_args(args: list[str], *, root: Path) -> list[str]:
+    """解析脚本参数：占位符 / 相对仓库路径 / 失效绝对路径按文件名回落到 scripts/。"""
+    out: list[str] = []
+    for raw in args:
+        expanded = _expand_placeholders(str(raw), root=root)
+        if not _looks_like_filesystem_arg(expanded):
+            out.append(expanded)
+            continue
+
+        path = Path(expanded)
+        if path.is_file():
+            out.append(str(path.resolve()))
+            continue
+
+        name = path.name
+        # 部署后旧机器绝对路径失效：按内置脚本名回落
+        if name == "mcp_utility_server.py":
+            builtin = (root / "scripts" / "mcp_utility_server.py").resolve()
+            if builtin.is_file():
+                if str(path) != str(builtin):
+                    logger.warning(
+                        "mcp stdio remapped utility script: %s -> %s", raw, builtin
+                    )
+                out.append(str(builtin))
+                continue
+
+        if not path.is_absolute():
+            candidate = (root / expanded).resolve()
+            out.append(str(candidate))
+            continue
+
+        out.append(expanded)
+    return out
+
+
 def _mssql_mcp_entry_js() -> Path | None:
     """定位全局 mssql-mcp-server 的 dist/index.js。"""
     node = _find_node()
@@ -130,10 +264,13 @@ def _resolve_stdio_command_args(command: str, args: list[str]) -> tuple[str, lis
     - Windows：避免 .cmd/.ps1 经管道秒退
     - npx -y mssql-mcp-server：优先改为 node + 全局包入口（快很多）
     - command=mssql-mcp-server：同样直连 dist/index.js
+    - python / ${PYTHON}：使用**当前 API 进程**的 sys.executable（同 venv，部署可移植）
+    - 相对脚本 / ${ZHONGJI_ROOT}：相对仓库根解析；失效绝对路径按文件名回落
     """
-    raw = (command or "").strip()
+    root = _project_root()
+    raw = _expand_placeholders((command or "").strip(), root=root)
     base = os.path.basename(raw).lower()
-    arg_list = [str(a) for a in args]
+    arg_list = _resolve_stdio_args([str(a) for a in args], root=root)
     arg_l = [a.lower() for a in arg_list]
 
     # 已全局安装时：绕过 npx 冷启动
@@ -168,6 +305,22 @@ def _resolve_stdio_command_args(command: str, args: list[str]) -> tuple[str, lis
         found = shutil.which("npx.cmd") or shutil.which("npx")
         if found:
             return found, arg_list
+
+    # 可移植 Python：别名 → API 同进程解释器；失效绝对路径亦回落
+    cmd_in = (command or "").strip()
+    if _is_python_command(cmd_in) or _is_python_command(raw):
+        alias = cmd_in.lower() in _PYTHON_COMMAND_ALIASES or raw.lower() in _PYTHON_COMMAND_ALIASES
+        if alias:
+            logger.info("mcp stdio using API sys.executable: %s", sys.executable)
+            return sys.executable, arg_list
+        if os.path.isfile(raw):
+            return raw, arg_list
+        logger.warning(
+            "mcp stdio python path missing, fallback sys.executable: %s -> %s",
+            raw,
+            sys.executable,
+        )
+        return sys.executable, arg_list
 
     if os.path.isfile(raw):
         return raw, arg_list

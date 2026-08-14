@@ -13,6 +13,11 @@ from db.models.mcp import McpServer
 
 logger = get_logger(__name__)
 
+# Windows 下 stdio aclose 会阻塞事件循环；若直接丢弃 stack 又会被 GC 在错误 Task 里
+# 触发 cancel scope 异常并取消正在返回的 HTTP 请求。因此把 stack 挂到进程级列表，
+# 故意泄漏到进程退出，优先保证 HTTP 能返回。
+_ORPHAN_STACKS: list[Any] = []
+
 
 class _PooledEntry:
     def __init__(self, client: McpClient, *, server_id: str) -> None:
@@ -33,7 +38,11 @@ class _PooledEntry:
                 )
             if self._session is not None:
                 return self._session
-            logger.info("mcp pool open session server=%s transport=%s", self.server_id, self.client.transport)
+            logger.info(
+                "mcp pool open session server=%s transport=%s",
+                self.server_id,
+                self.client.transport,
+            )
             stack = AsyncExitStack()
             await stack.__aenter__()
             try:
@@ -57,15 +66,14 @@ class _PooledEntry:
                 timeout=timeout,
             )
         except TimeoutError as exc:
-            # 超时后会话可能半死，丢弃以便下次重建
-            await self.close()
+            await self.abandon(reason=f"call_tool_timeout:{name}")
             raise AppError(
                 ErrorCode.INTERNAL,
                 f"MCP call_tool 超时（{timeout:.0f}s）：{name}",
                 status_code=502,
             ) from exc
         except Exception:
-            await self.close()
+            await self.abandon(reason=f"call_tool_error:{name}")
             raise
 
         is_error = bool(getattr(result, "isError", None) or getattr(result, "is_error", False))
@@ -75,18 +83,32 @@ class _PooledEntry:
             is_error=is_error,
         )
 
-    async def close(self) -> None:
+    async def abandon(self, *, reason: str = "") -> None:
+        """结束池化会话但不调用会卡死的 aclose。
+
+        将 AsyncExitStack 挂到模块级列表，避免 GC 在错误任务中退出 cancel scope，
+        从而取消已经算完的 HTTP 请求（前端表现为「查询超时」）。
+        """
         async with self._lock:
+            stack = self._stack
             self._closed = True
             self._session = None
-            stack = self._stack
             self._stack = None
-            if stack is None:
-                return
-            try:
-                await asyncio.wait_for(stack.aclose(), timeout=3.0)
-            except Exception as exc:  # noqa: BLE001
-                logger.warning("mcp pool close abandoned server=%s: %s", self.server_id, exc)
+        if stack is not None:
+            _ORPHAN_STACKS.append(stack)
+            # 防止列表无限增长（进程内多次分析）
+            if len(_ORPHAN_STACKS) > 32:
+                _ORPHAN_STACKS.pop(0)
+            logger.warning(
+                "mcp pool abandoned server=%s reason=%s orphans=%s "
+                "(stdio child kept until API process exit)",
+                self.server_id,
+                reason or "close",
+                len(_ORPHAN_STACKS),
+            )
+
+    async def close(self) -> None:
+        await self.abandon(reason="close")
 
 
 class McpSessionPool:
@@ -117,7 +139,6 @@ class McpSessionPool:
         try:
             return await entry.call_tool(tool_name, arguments)
         except Exception:
-            # 失败条目剔除，避免脏会话被继续复用
             async with self._lock:
                 cur = self._entries.get(server.public_id)
                 if cur is entry:
@@ -129,6 +150,6 @@ class McpSessionPool:
             entries = list(self._entries.values())
             self._entries.clear()
         for entry in entries:
-            await entry.close()
+            await entry.abandon(reason="pool_aclose")
         if entries:
-            logger.info("mcp pool closed %s session(s)", len(entries))
+            logger.warning("mcp pool abandoned %s session(s)", len(entries))

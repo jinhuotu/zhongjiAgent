@@ -13,6 +13,7 @@ ADMIN_ONLY_MENUS = frozenset(
         "/mcp-manage",
         "/workflows",
         "/users",
+        "/logs",
     }
 )
 
@@ -22,6 +23,7 @@ ALL_MENUS: tuple[str, ...] = (
     "/realtime",
     "/ai-chat",
     "/ai-reports",
+    "/casting-yield",
     "/scene-agents",
     "/model-manage",
     "/prompt-manage",
@@ -93,6 +95,7 @@ ALL_MENUS: tuple[str, ...] = (
     "/reports",
     "/alerts",
     "/users",
+    "/logs",
     "/settings",
 )
 

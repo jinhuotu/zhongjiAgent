@@ -54,6 +54,8 @@ class Settings(BaseSettings):
     chat_ttl_scan_threshold_seconds: int = 3600
     chat_ttl_scan_cron: str = "0 3 * * *"  # 每天 03:00
     hot_config_hash_key: str = "hot:config"
+    # 操作日志 / 登录日志滚动保留天数（超时删除，系统最多保留该窗口）
+    audit_log_retention_days: int = 7
 
     jwt_secret_key: str = "change-me-in-production-use-long-random-string"
     jwt_algorithm: str = "HS256"
@@ -61,6 +63,10 @@ class Settings(BaseSettings):
     jwt_refresh_token_expire_days: int = 7
 
     storage_root: str = "./storage"
+
+    # MCP stdio 仓库根（可选）。不设则自动探测 scripts/mcp_utility_server.py 所在根目录。
+    # 部署非标准目录结构时可设：ZHONGJI_ROOT=/opt/zhongjiAgent
+    zhongji_root: str = ""
 
     # ---- LLM (AI 智能问答 / 报告) OpenAI-compatible ----
     llm_api_base: str = ""

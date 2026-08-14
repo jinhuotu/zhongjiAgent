@@ -155,46 +155,77 @@ class LLMClient:
             payload["tools"] = tools
             payload["tool_choice"] = "auto"
         timeout = httpx.Timeout(self.timeout_seconds)
-        async with httpx.AsyncClient(timeout=timeout) as client:
-            resp = await client.post(url, headers=self._headers(), json=payload)
-            if resp.status_code >= 400:
-                raise AppError(
-                    ErrorCode.INTERNAL,
-                    f"LLM request failed ({resp.status_code}): {resp.text[:300]}",
-                    status_code=502,
-                )
-            data = resp.json()
-            message = (data.get("choices") or [{}])[0].get("message") or {}
-            content = "" if message.get("content") is None else str(message.get("content"))
-            tool_calls_raw = message.get("tool_calls") or []
-            tool_calls: list[dict[str, Any]] = []
-            for tc in tool_calls_raw:
-                if not isinstance(tc, dict):
-                    continue
-                fn = tc.get("function") or {}
-                tool_calls.append(
-                    {
-                        "id": str(tc.get("id") or ""),
-                        "name": str(fn.get("name") or ""),
-                        "arguments": str(fn.get("arguments") or "{}"),
-                    }
-                )
-
-            # 部分模型（如豆包）把工具调用写成 DSML 文本而非标准 tool_calls
-            if content and (not tool_calls or looks_like_dsml(content)):
-                cleaned, parsed = parse_tool_calls_from_content(content)
-                if parsed:
-                    logger.info(
-                        "llm parsed %s inline tool call(s) from content (DSML/XML)",
-                        len(parsed),
+        try:
+            async with httpx.AsyncClient(timeout=timeout) as client:
+                resp = await client.post(url, headers=self._headers(), json=payload)
+                if resp.status_code >= 400:
+                    raise AppError(
+                        ErrorCode.INTERNAL,
+                        f"LLM request failed ({resp.status_code}): {resp.text[:300]}",
+                        status_code=502,
                     )
-                    if not tool_calls:
-                        tool_calls = parsed
-                    content = cleaned
-                else:
-                    content = strip_tool_call_markup(content)
+                try:
+                    data = resp.json()
+                except json.JSONDecodeError as exc:
+                    raise AppError(
+                        ErrorCode.INTERNAL,
+                        "模型接口返回空内容，无法解析 JSON。"
+                        f" HTTP {resp.status_code} body={resp.text[:200]!r}",
+                        status_code=502,
+                    ) from exc
+        except AppError:
+            raise
+        except httpx.TimeoutException as exc:
+            logger.warning(
+                "llm complete timeout model=%s seconds=%s type=%s",
+                model,
+                self.timeout_seconds,
+                type(exc).__name__,
+            )
+            raise AppError(
+                ErrorCode.INTERNAL,
+                f"模型请求超时（{self.timeout_seconds:.0f}s）",
+                status_code=504,
+            ) from exc
+        except httpx.HTTPError as exc:
+            logger.exception("llm complete http failed")
+            detail = (str(exc) or "").strip() or type(exc).__name__
+            raise AppError(
+                ErrorCode.INTERNAL,
+                f"模型请求失败：{detail}",
+                status_code=502,
+            ) from exc
+        message = (data.get("choices") or [{}])[0].get("message") or {}
+        content = "" if message.get("content") is None else str(message.get("content"))
+        tool_calls_raw = message.get("tool_calls") or []
+        tool_calls: list[dict[str, Any]] = []
+        for tc in tool_calls_raw:
+            if not isinstance(tc, dict):
+                continue
+            fn = tc.get("function") or {}
+            tool_calls.append(
+                {
+                    "id": str(tc.get("id") or ""),
+                    "name": str(fn.get("name") or ""),
+                    "arguments": str(fn.get("arguments") or "{}"),
+                }
+            )
 
-            return {
-                "content": content,
-                "tool_calls": tool_calls,
-            }
+        # 部分模型（如豆包）把工具调用写成 DSML 文本而非标准 tool_calls
+        if content and (not tool_calls or looks_like_dsml(content)):
+            cleaned, parsed = parse_tool_calls_from_content(content)
+            if parsed:
+                logger.info(
+                    "llm parsed %s inline tool call(s) from content (DSML/XML)",
+                    len(parsed),
+                )
+                if not tool_calls:
+                    tool_calls = parsed
+                content = cleaned
+            else:
+                content = strip_tool_call_markup(content)
+
+        return {
+            "content": content,
+            "tool_calls": tool_calls,
+        }

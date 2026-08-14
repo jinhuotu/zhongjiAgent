@@ -79,6 +79,8 @@ async def execute_node(
         return await _exec_agent(db, data=data, state=state)
     if ntype == "mcp":
         return await _exec_mcp(db, data=data, state=state)
+    if ntype == "yield_analysis":
+        return await _exec_yield_analysis(db, data=data, state=state)
     if ntype == "end":
         return await _exec_end(state)
     raise AppError(
@@ -291,6 +293,138 @@ async def _exec_mcp(
         "toolName": tool_name,
         "isError": bool(result.get("isError")) if isinstance(result, dict) else False,
         "preview": text[:500],
+    }
+
+
+async def _exec_yield_analysis(
+    db: AsyncSession, *, data: dict[str, Any], state: dict[str, Any]
+) -> dict[str, Any]:
+    """调用铸造良率分析，把 rawContext 注入 context 供后续 LLM 节点使用。"""
+    from api.services.casting.yield_analysis import analyze_yield
+
+    guid = str(
+        data.get("inventoryGuid")
+        or data.get("inventory_guid")
+        or ""
+    ).strip()
+    guid = str(_replace_templates(guid, state) or "").strip()
+    query = str(
+        data.get("query")
+        or data.get("inventoryName")
+        or data.get("inventory_name")
+        or ""
+    ).strip()
+    query = str(_replace_templates(query, state) or "").strip()
+
+    if not guid:
+        raw_in = state.get("input")
+        if isinstance(raw_in, dict):
+            guid = str(
+                raw_in.get("inventoryGuid")
+                or raw_in.get("inventory_guid")
+                or ""
+            ).strip()
+            if not query:
+                query = str(
+                    raw_in.get("query")
+                    or raw_in.get("inventoryName")
+                    or raw_in.get("inventory_name")
+                    or ""
+                ).strip()
+    if not guid:
+        vars_map = state.get("vars") if isinstance(state.get("vars"), dict) else {}
+        guid = str(vars_map.get("inventoryGuid") or "").strip()
+        if not query:
+            query = str(
+                vars_map.get("query")
+                or vars_map.get("inventoryName")
+                or ""
+            ).strip()
+    if not guid and not query:
+        # 试跑：query 可能是 GUID 或物料名称
+        q = _as_text(state.get("query")).strip()
+        if q:
+            query = q.split("\n", 1)[0].strip()
+
+    if not guid and not query:
+        raise AppError(
+            ErrorCode.VALIDATION,
+            "yield_analysis node: inventoryGuid 或 query（名称/编码）required "
+            "(节点配置 / start.input / query)",
+            status_code=422,
+        )
+
+    include_weather = bool(
+        data.get("includeWeather")
+        if data.get("includeWeather") is not None
+        else data.get("include_weather", True)
+    )
+    analysis = await analyze_yield(
+        db,
+        inventory_guid=guid or None,
+        query=query or None,
+        include_weather=include_weather,
+    )
+    state["yieldAnalysis"] = analysis
+    resolved_guid = str(analysis.get("inventoryGuid") or guid or "").strip()
+    vars_map = dict(state.get("vars") or {})
+    if resolved_guid:
+        vars_map["inventoryGuid"] = resolved_guid
+    if query:
+        vars_map["query"] = query
+    vars_map["yieldFound"] = bool(analysis.get("found"))
+    state["vars"] = vars_map
+
+    if analysis.get("needSelect"):
+        cands = analysis.get("candidates") or []
+        msg = str(analysis.get("message") or "请选择物料后继续分析")
+        names = ", ".join(
+            f"{c.get('name')}({c.get('code')})" for c in cands[:8] if isinstance(c, dict)
+        )
+        detail = f"{msg}" + (f"：{names}" if names else "")
+        state["output"] = detail
+        prev = _as_text(state.get("context")).strip()
+        block = f"【良率分析】\n{detail}"
+        state["context"] = f"{prev}\n\n{block}".strip() if prev else block
+        return {
+            "found": False,
+            "needSelect": True,
+            "inventoryGuid": resolved_guid,
+            "message": detail,
+            "candidateCount": len(cands),
+        }
+
+    if not analysis.get("found"):
+        msg = str(analysis.get("message") or "没有该型号的历史订单/物料档案")
+        state["output"] = msg
+        prev = _as_text(state.get("context")).strip()
+        block = f"【良率分析】\n{msg}"
+        state["context"] = f"{prev}\n\n{block}".strip() if prev else block
+        return {
+            "found": False,
+            "inventoryGuid": resolved_guid,
+            "message": msg,
+        }
+
+    raw_ctx = str(analysis.get("rawContext") or "")
+    prev = _as_text(state.get("context")).strip()
+    block = f"【良率分析 rawContext】\n{raw_ctx}"
+    state["context"] = f"{prev}\n\n{block}".strip() if prev else block
+    # 便于 end 直接看到摘要
+    best = analysis.get("bestLine") or {}
+    state["output"] = (
+        f"found=true InventoryGUID={resolved_guid} "
+        f"最优班组={best.get('lineName')}({best.get('lineCode')}) "
+        f"良率={best.get('yieldRate')}"
+    )
+    return {
+        "found": True,
+        "inventoryGuid": resolved_guid,
+        "lineCount": len(analysis.get("lines") or []),
+        "bestLine": best,
+        "includeWeather": include_weather,
+        "hasWeather": bool(analysis.get("weatherSummary")),
+        "preview": raw_ctx[:400],
     }
 
 

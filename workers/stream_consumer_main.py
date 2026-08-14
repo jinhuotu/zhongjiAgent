@@ -22,11 +22,15 @@ def main() -> None:
 
 
 async def _async_main() -> None:
+    from datetime import datetime
+
     from apscheduler.schedulers.asyncio import AsyncIOScheduler
     from apscheduler.triggers.cron import CronTrigger
+    from apscheduler.triggers.interval import IntervalTrigger
 
     from common.config import get_settings
     from common.logging import get_logger, setup_logging
+    from workers.audit_purge import purge_expired_audit_logs
     from workers.chat_stream_consumer import ChatStreamConsumer
     from workers.ttl_flush import scan_and_flush_expiring_sessions
     from common.redis_client import close_redis
@@ -59,8 +63,21 @@ async def _async_main() -> None:
         max_instances=1,
         coalesce=True,
     )
+    scheduler.add_job(
+        purge_expired_audit_logs,
+        trigger=IntervalTrigger(hours=1),
+        id="audit_log_purge",
+        replace_existing=True,
+        max_instances=1,
+        coalesce=True,
+        next_run_time=datetime.now(),
+    )
     scheduler.start()
-    logger.info("APScheduler started ttl_cron=%s", settings.chat_ttl_scan_cron)
+    logger.info(
+        "APScheduler started ttl_cron=%s audit_purge=hourly retention_days=%s",
+        settings.chat_ttl_scan_cron,
+        settings.audit_log_retention_days,
+    )
 
     loop = asyncio.get_running_loop()
 

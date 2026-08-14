@@ -18,7 +18,9 @@ from db.models.workflow import (
     WorkflowVersion,
 )
 
-_NODE_TYPES = frozenset({"start", "end", "knowledge", "llm", "agent", "mcp"})
+_NODE_TYPES = frozenset(
+    {"start", "end", "knowledge", "llm", "agent", "mcp", "yield_analysis"}
+)
 
 
 def short_id(n: int = 12) -> str:

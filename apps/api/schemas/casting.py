@@ -67,3 +67,39 @@ class YieldAnalysisResponse(BaseModel):
     needSelect: bool = False
     candidates: list[dict[str, Any]] = Field(default_factory=list)
     query: str | None = None
+
+
+class DrawingExtractedBody(BaseModel):
+    dims: list[dict[str, Any]] = Field(default_factory=list)
+    diameters: list[float] = Field(default_factory=list)
+    specHints: list[str] = Field(default_factory=list)
+    schemeText: str = ""
+    keywords: list[str] = Field(default_factory=list)
+    confidence: float | None = None
+
+
+class DrawingMatchJsonBody(BaseModel):
+    extracted: DrawingExtractedBody
+    top: int = Field(default=5, ge=1, le=20)
+    mode: str = Field(default="fast", description="fast|deep")
+    visionModelId: str | None = Field(
+        default=None, description="重匹配不识图时可忽略"
+    )
+
+
+class PeelReportBody(BaseModel):
+    contractCode: str = Field(..., min_length=1, max_length=32, description="销售合同号")
+    dateFrom: str | None = Field(default=None, max_length=10, description="浇铸日起 YYYY-MM-DD")
+    dateTo: str | None = Field(default=None, max_length=10, description="浇铸日止 YYYY-MM-DD")
+    materialLike: str = Field(
+        default="PT",
+        max_length=32,
+        description="材质名包含，默认 PT → 33#PT",
+    )
+
+
+class WechatDailyParseBody(BaseModel):
+    text: str = Field(..., min_length=8, max_length=20000, description="微信群日报原文")
+    year: int = Field(default=2026, ge=2020, le=2100)
+    month: int | None = Field(default=None, ge=1, le=12)
+    useLlm: bool = Field(default=True, description="规则抽不全时是否调用对话模型")

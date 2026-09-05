@@ -23,7 +23,15 @@ class ModelConfig(Base):
     name: Mapped[str] = mapped_column(String(128), nullable=False, comment="配置名称")
     # llm | embedding
     kind: Mapped[str] = mapped_column(
-        String(16), nullable=False, index=True, comment="类型：llm/embedding"
+        String(16), nullable=False, index=True, comment="接口类别：llm/embedding"
+    )
+    # text_chat | multimodal_vision | multimodal_audio | text_embedding
+    model_type: Mapped[str] = mapped_column(
+        String(32),
+        nullable=False,
+        default="text_chat",
+        index=True,
+        comment="模型类型：文本对话/多模态视觉/多模态音频/文本向量",
     )
     api_base: Mapped[str] = mapped_column(String(512), nullable=False, comment="API Base URL")
     api_key: Mapped[str] = mapped_column(String(512), nullable=False, comment="API Key")

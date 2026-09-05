@@ -118,6 +118,15 @@ def create_app() -> FastAPI:
     app.include_router(workflows.router, prefix=settings.api_prefix)
     app.include_router(casting.router, prefix=settings.api_prefix)
 
+    logging.getLogger("api.app").info(
+        "casting routes: %s",
+        [
+            getattr(r, "path", "")
+            for r in casting.router.routes
+            if getattr(r, "path", "")
+        ],
+    )
+
     return app
 
 

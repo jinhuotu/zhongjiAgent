@@ -1,4 +1,4 @@
-"""铸造同型号良率分析 API。"""
+"""铸造同型号良率分析 API（含脱棱角统计、微信质检日报解析）。"""
 
 from __future__ import annotations
 
@@ -6,20 +6,26 @@ import asyncio
 import json
 from typing import Any, Self
 
-from fastapi import APIRouter
+from fastapi import APIRouter, File, Form, UploadFile
 from pydantic import BaseModel, Field, model_validator
 from sse_starlette.event import ServerSentEvent
 from sse_starlette.sse import EventSourceResponse
 
 from api.deps import CurrentUser, DbSession
 from api.schemas.casting import (
+    DrawingMatchJsonBody,
     InventorySearchBody,
     OrderItemsBody,
     OrderSearchBody,
+    PeelReportBody,
+    WechatDailyParseBody,
     YieldAnalysisBody,
 )
+from api.services.casting import drawing_match as drawing_svc
+from api.services.casting import peel_report as peel_svc
+from api.services.casting import wechat_daily as wechat_daily_svc
 from api.services.casting import yield_analysis as yield_svc
-from common.errors import AppError
+from common.errors import AppError, ErrorCode
 from common.logging import get_logger
 from common.response import ok
 
@@ -164,6 +170,73 @@ async def casting_inventory_search(
         db, query=body.query, top=body.top
     )
     return ok({"query": body.query.strip(), "items": items, "count": len(items)})
+
+
+@router.post("/drawing-match")
+async def casting_drawing_match(
+    db: DbSession,
+    user: CurrentUser,
+    file: UploadFile | None = File(default=None),
+    extracted: str | None = Form(default=None),
+    mode: str = Form(default="fast"),
+    top: int = Form(default=5),
+    visionModelId: str | None = Form(default=None),
+) -> dict:
+    """上传图纸：指定多模态视觉识参 → 模糊匹配 Top5；分析/总结仍用文本模型绑定。"""
+    _ = user
+    image_bytes: bytes | None = None
+    content_type = "image/png"
+    if file is not None:
+        raw = await file.read()
+        if raw:
+            image_bytes = raw
+            content_type = file.content_type or "image/png"
+
+    extracted_obj: dict[str, Any] | None = None
+    if extracted and extracted.strip():
+        try:
+            parsed = json.loads(extracted)
+        except json.JSONDecodeError as exc:
+            raise AppError(
+                ErrorCode.VALIDATION,
+                f"extracted 不是合法 JSON：{exc}",
+                status_code=422,
+            ) from exc
+        if not isinstance(parsed, dict):
+            raise AppError(
+                ErrorCode.VALIDATION, "extracted 须为 JSON 对象", status_code=422
+            )
+        extracted_obj = parsed
+
+    data = await drawing_svc.match_drawing(
+        db,
+        image_bytes=image_bytes,
+        content_type=content_type,
+        extracted=extracted_obj,
+        mode=(mode or "fast").strip() or "fast",
+        top=max(1, min(int(top or 5), 20)),
+        vision_model_id=(visionModelId or "").strip() or None,
+    )
+    return ok(data)
+
+
+@router.post("/drawing-match/json")
+async def casting_drawing_match_json(
+    body: DrawingMatchJsonBody,
+    db: DbSession,
+    user: CurrentUser,
+) -> dict:
+    """用已抽取/修正参数重新匹配（不识图，无需视觉模型）。"""
+    _ = user
+    data = await drawing_svc.match_drawing(
+        db,
+        image_bytes=None,
+        extracted=body.extracted.model_dump(),
+        mode=body.mode,
+        top=body.top,
+        vision_model_id=body.visionModelId,
+    )
+    return ok(data)
 
 
 @router.post("/order-search")
@@ -345,3 +418,39 @@ async def casting_yield_document_stream(
     return EventSourceResponse(
         _iter_sse(queue, runner, cancel_on_disconnect=False)
     )
+
+
+@router.post("/peel-report")
+async def casting_peel_report(
+    body: PeelReportBody,
+    db: DbSession,
+    user: CurrentUser,
+) -> dict:
+    """合同 PT 砖材 213 脱棱角统计（出砖=合同物料全部浇铸记录）。"""
+    _ = user
+    data = await peel_svc.query_peel_report(
+        db,
+        contract_code=body.contractCode,
+        date_from=body.dateFrom,
+        date_to=body.dateTo,
+        material_like=body.materialLike,
+    )
+    return ok(data)
+
+
+@router.post("/wechat-daily-parse")
+async def casting_wechat_daily_parse(
+    body: WechatDailyParseBody,
+    db: DbSession,
+    user: CurrentUser,
+) -> dict:
+    """粘贴微信群质检日报文字，抽出当天一列（台数/一检/二检/明细）。"""
+    _ = user
+    data = await wechat_daily_svc.parse_wechat_daily(
+        db,
+        text=body.text,
+        default_year=body.year,
+        default_month=body.month,
+        use_llm=body.useLlm,
+    )
+    return ok(data)

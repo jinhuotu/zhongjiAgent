@@ -40,7 +40,7 @@ class LLMClient:
         if not self.api_base or not self.api_key or not self.fixed_model:
             raise AppError(
                 ErrorCode.INTERNAL,
-                "LLM not configured: 请在「模型管理」中配置并启用对话模型（快速/深度）",
+                "LLM not configured: 请在「模型管理」中配置并启用对话模型",
                 status_code=503,
             )
 

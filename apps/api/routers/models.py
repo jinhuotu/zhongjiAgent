@@ -17,6 +17,23 @@ async def models_runtime(db: DbSession, user: CurrentUser) -> dict:
     return ok(await configs_svc.runtime_status(db))
 
 
+@router.get("/options")
+async def models_options(
+    db: DbSession,
+    user: CurrentUser,
+    kind: str | None = Query(default=None),
+    modelType: str | None = Query(default=None),
+) -> dict:
+    """任意登录用户可读：启用中的模型选项（供业务页下拉，不含 Key）。"""
+    _ = user
+    if kind and kind not in ("llm", "embedding"):
+        kind = None
+    items = await configs_svc.list_enabled_options(
+        db, kind=kind, model_type=modelType
+    )
+    return ok({"items": items})
+
+
 @router.get("")
 async def models_list(
     db: DbSession,
@@ -36,6 +53,7 @@ async def models_create(body: CreateModelConfigRequest, db: DbSession, admin: Ad
         db,
         name=body.name,
         kind=body.kind,
+        model_type=body.modelType,
         api_base=body.apiBase,
         api_key=body.apiKey,
         model_name=body.modelName,
@@ -64,6 +82,7 @@ async def models_update(
         db,
         public_id=model_id,
         name=body.name,
+        model_type=body.modelType,
         api_base=body.apiBase,
         api_key=body.apiKey,
         model_name=body.modelName,

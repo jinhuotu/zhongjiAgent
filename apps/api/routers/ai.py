@@ -50,6 +50,8 @@ class ChatRequest(BaseModel):
     promptId: str | None = Field(default=None, max_length=32)
     # 场景智能体：若传有效 id，则覆盖 mode / promptId / knowledgeBaseIds / 工具策略
     agentId: str | None = Field(default=None, max_length=32)
+    # 指定模型配置 publicId；未传则用快速/深度默认绑定，再回退到任一已启用对话模型
+    modelId: str | None = Field(default=None, max_length=32)
 
 
 class RelatedRequest(BaseModel):
@@ -83,6 +85,7 @@ async def _resolve_chat_bindings(db: DbSession, body: ChatRequest) -> dict[str, 
             "knowledgeBaseIds": _normalize_kb_ids(body.knowledgeBaseIds),
             "toolsEnabled": True,
             "allowedToolIds": None,
+            "modelId": (body.modelId or "").strip() or None,
         }
 
     from api.services.agents import configs as agent_configs
@@ -111,6 +114,7 @@ async def _resolve_chat_bindings(db: DbSession, body: ChatRequest) -> dict[str, 
         "knowledgeBaseIds": _normalize_kb_ids(bundle.get("knowledgeBaseIds") or []),
         "toolsEnabled": tools_enabled,
         "allowedToolIds": allowed,
+        "modelId": (body.modelId or "").strip() or None,
     }
 
 @router.get("/status")
@@ -232,8 +236,9 @@ async def ai_chat(
     allowed_tool_ids: list[str] | None = bindings["allowedToolIds"]
     agent_id: str | None = bindings["agentId"]
     agent_name: str | None = bindings["agentName"]
+    model_id: str | None = bindings.get("modelId")
 
-    await build_llm_client(db, chat_mode)
+    await build_llm_client(db, chat_mode, model_id=model_id)
     user_text = _extract_user_content(body)
 
     session = await sessions_svc.get_session_for_user(
@@ -379,7 +384,7 @@ async def ai_chat(
 
                     accumulated = ""
                     try:
-                        client = await build_llm_client(db, chat_mode)
+                        client = await build_llm_client(db, chat_mode, model_id=model_id)
                         async for ev in run_chat_with_mcp(
                             db,
                             client=client,

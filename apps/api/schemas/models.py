@@ -1,12 +1,20 @@
 from __future__ import annotations
 
-from pydantic import BaseModel, Field
+from pydantic import AliasChoices, BaseModel, ConfigDict, Field
 from typing import Literal
+
+ModelType = Literal["text_chat", "multimodal_vision", "multimodal_audio", "text_embedding"]
 
 
 class CreateModelConfigRequest(BaseModel):
+    model_config = ConfigDict(populate_by_name=True)
+
     name: str = Field(min_length=1, max_length=128)
     kind: Literal["llm", "embedding"]
+    modelType: ModelType = Field(
+        default="text_chat",
+        validation_alias=AliasChoices("modelType", "model_type"),
+    )
     apiBase: str = Field(min_length=1, max_length=512)
     apiKey: str = Field(min_length=1, max_length=512)
     modelName: str = Field(min_length=1, max_length=128)
@@ -21,7 +29,13 @@ class CreateModelConfigRequest(BaseModel):
 
 
 class UpdateModelConfigRequest(BaseModel):
+    model_config = ConfigDict(populate_by_name=True)
+
     name: str | None = Field(default=None, min_length=1, max_length=128)
+    modelType: ModelType | None = Field(
+        default=None,
+        validation_alias=AliasChoices("modelType", "model_type"),
+    )
     apiBase: str | None = Field(default=None, min_length=1, max_length=512)
     apiKey: str | None = Field(default=None, max_length=512)
     modelName: str | None = Field(default=None, min_length=1, max_length=128)

@@ -10,6 +10,18 @@ from common.errors import AppError, ErrorCode
 from db.models.model_config import ModelConfig
 
 Kind = Literal["llm", "embedding"]
+ModelType = Literal["text_chat", "multimodal_vision", "multimodal_audio", "text_embedding"]
+
+LLM_MODEL_TYPES: tuple[str, ...] = ("text_chat", "multimodal_vision", "multimodal_audio")
+EMBEDDING_MODEL_TYPES: tuple[str, ...] = ("text_embedding",)
+
+
+def normalize_model_type(kind: str, model_type: str | None) -> str:
+    if kind == "embedding":
+        return "text_embedding"
+    if model_type in LLM_MODEL_TYPES:
+        return model_type
+    return "text_chat"
 
 
 def short_id(n: int = 12) -> str:
@@ -26,10 +38,13 @@ def mask_api_key(key: str) -> str:
 
 
 def to_item(cfg: ModelConfig, *, reveal_key: bool = False) -> dict[str, Any]:
+    kind = cfg.kind
+    model_type = getattr(cfg, "model_type", None)
     return {
         "id": cfg.public_id,
         "name": cfg.name,
-        "kind": cfg.kind,
+        "kind": kind,
+        "modelType": normalize_model_type(kind, model_type),
         "apiBase": cfg.api_base,
         "apiKeyMasked": mask_api_key(cfg.api_key),
         "apiKey": cfg.api_key if reveal_key else None,
@@ -77,7 +92,12 @@ async def _clear_scope(db: AsyncSession, *, kind: str, scope: str) -> None:
         values["scope_embedding"] = False
     else:
         return
-    await db.execute(update(ModelConfig).where(ModelConfig.kind == kind).values(**values))
+    await db.execute(
+        update(ModelConfig)
+        .where(ModelConfig.kind == kind)
+        .values(**values)
+        .execution_options(synchronize_session=False)
+    )
 
 
 async def create_config(
@@ -88,6 +108,7 @@ async def create_config(
     api_base: str,
     api_key: str,
     model_name: str,
+    model_type: str | None = None,
     temperature: float | None = None,
     timeout_seconds: float = 120.0,
     embedding_dim: int | None = None,
@@ -118,6 +139,7 @@ async def create_config(
         public_id=short_id(12),
         name=name.strip()[:128],
         kind=kind,
+        model_type=normalize_model_type(kind, model_type),
         api_base=api_base.strip().rstrip("/"),
         api_key=api_key.strip(),
         model_name=model_name.strip()[:128],
@@ -142,6 +164,7 @@ async def update_config(
     *,
     public_id: str,
     name: str | None = None,
+    model_type: str | None = None,
     api_base: str | None = None,
     api_key: str | None = None,
     model_name: str | None = None,
@@ -156,6 +179,9 @@ async def update_config(
     clear_temperature: bool = False,
 ) -> dict[str, Any]:
     cfg = await get_by_public_id(db, public_id)
+    pending_model_type = (
+        normalize_model_type(cfg.kind, model_type) if model_type is not None else None
+    )
     if name is not None:
         if not name.strip():
             raise AppError(ErrorCode.VALIDATION, "name required", status_code=422)
@@ -200,6 +226,15 @@ async def update_config(
         cfg.scope_fast = False
         cfg.scope_deep = False
 
+    if pending_model_type is not None:
+        cfg.model_type = pending_model_type
+        await db.execute(
+            update(ModelConfig)
+            .where(ModelConfig.id == cfg.id)
+            .values(model_type=pending_model_type)
+            .execution_options(synchronize_session=False)
+        )
+
     await db.commit()
     await db.refresh(cfg)
     return to_item(cfg)
@@ -234,14 +269,68 @@ async def resolve_active_embedding(db: AsyncSession) -> ModelConfig | None:
     return result.scalar_one_or_none()
 
 
+async def resolve_first_enabled_llm(
+    db: AsyncSession,
+    *,
+    model_type: str | None = None,
+) -> ModelConfig | None:
+    """取启用中的 LLM；可按 model_type 过滤（如 multimodal_vision）。"""
+    stmt = (
+        select(ModelConfig)
+        .where(ModelConfig.kind == "llm", ModelConfig.enabled.is_(True))
+        .order_by(ModelConfig.updated_at.desc())
+    )
+    if model_type:
+        stmt = stmt.where(ModelConfig.model_type == model_type)
+    result = await db.execute(stmt.limit(1))
+    return result.scalar_one_or_none()
+
+
+async def list_enabled_options(
+    db: AsyncSession,
+    *,
+    kind: str | None = None,
+    model_type: str | None = None,
+) -> list[dict[str, Any]]:
+    """登录用户可选模型清单（不含 Key）。"""
+    stmt = (
+        select(ModelConfig)
+        .where(ModelConfig.enabled == True)
+        .order_by(ModelConfig.updated_at.desc())
+    )
+    if kind in ("llm", "embedding"):
+        stmt = stmt.where(ModelConfig.kind == kind)
+    if model_type:
+        stmt = stmt.where(ModelConfig.model_type == model_type)
+    result = await db.execute(stmt)
+    items: list[dict[str, Any]] = []
+    for cfg in result.scalars().all():
+        mt = normalize_model_type(cfg.kind, getattr(cfg, "model_type", None))
+        items.append(
+            {
+                "id": cfg.public_id,
+                "name": cfg.name,
+                "kind": cfg.kind,
+                "modelType": mt,
+                "modelName": cfg.model_name,
+                "scopeFast": bool(cfg.scope_fast),
+                "scopeDeep": bool(cfg.scope_deep),
+                "scopeEmbedding": bool(cfg.scope_embedding),
+            }
+        )
+    return items
+
+
 async def runtime_status(db: AsyncSession) -> dict[str, Any]:
     fast = await resolve_active_llm(db, "fast")
     deep = await resolve_active_llm(db, "deep")
     emb = await resolve_active_embedding(db)
+    llms = await list_enabled_options(db, kind="llm")
     return {
         "llm_fast": to_item(fast) if fast else None,
         "llm_deep": to_item(deep) if deep else None,
         "embedding": to_item(emb) if emb else None,
-        "llm_configured": bool(fast or deep),
+        "llms": llms,
+        "llm_configured": bool(fast or deep or llms),
         "embedding_configured": bool(emb),
     }

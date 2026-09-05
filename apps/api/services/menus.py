@@ -24,6 +24,8 @@ ALL_MENUS: tuple[str, ...] = (
     "/ai-chat",
     "/ai-reports",
     "/casting-yield",
+    "/casting-peel",
+    "/casting-qa-month",
     "/scene-agents",
     "/model-manage",
     "/prompt-manage",

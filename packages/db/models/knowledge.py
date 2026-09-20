@@ -2,7 +2,7 @@ from __future__ import annotations
 
 from datetime import datetime
 
-from sqlalchemy import BigInteger, DateTime, ForeignKey, Integer, String, Text, func
+from sqlalchemy import BigInteger, Boolean, DateTime, ForeignKey, Integer, String, Text, UniqueConstraint, func
 from sqlalchemy.dialects.mysql import JSON
 from sqlalchemy.orm import Mapped, mapped_column, relationship
 
@@ -48,6 +48,50 @@ class KnowledgeBase(Base):
         back_populates="base",
         lazy="selectin",
     )
+    acl_entries: Mapped[list["KnowledgeBaseAcl"]] = relationship(
+        "KnowledgeBaseAcl",
+        back_populates="base",
+        lazy="selectin",
+        cascade="all, delete-orphan",
+    )
+
+
+class KnowledgeBaseAcl(Base):
+    """知识库访问授权（查看 / 使用 / 维护）。"""
+
+    __tablename__ = "knowledge_base_acl"
+    __table_args__ = (
+        UniqueConstraint("base_id", "subject_type", "subject_id", name="uq_kb_acl_subject"),
+        {"comment": "知识库访问授权"},
+    )
+
+    id: Mapped[int] = mapped_column(
+        BigInteger, primary_key=True, autoincrement=True, comment="主键"
+    )
+    base_id: Mapped[int] = mapped_column(
+        BigInteger,
+        ForeignKey("knowledge_bases.id", ondelete="CASCADE"),
+        nullable=False,
+        index=True,
+        comment="知识库ID",
+    )
+    subject_type: Mapped[str] = mapped_column(
+        String(16), nullable=False, comment="主体：user / role"
+    )
+    subject_id: Mapped[int] = mapped_column(
+        BigInteger, nullable=False, comment="users.id 或 roles.id"
+    )
+    can_view: Mapped[bool] = mapped_column(
+        Boolean, nullable=False, default=True, comment="列表与详情可见"
+    )
+    can_use: Mapped[bool] = mapped_column(
+        Boolean, nullable=False, default=False, comment="对话检索 / 语义检索"
+    )
+    can_manage: Mapped[bool] = mapped_column(
+        Boolean, nullable=False, default=False, comment="改库、导入删除资料、分配权限"
+    )
+
+    base: Mapped[KnowledgeBase] = relationship("KnowledgeBase", back_populates="acl_entries")
 
 
 class KnowledgeDocument(Base):
@@ -74,7 +118,7 @@ class KnowledgeDocument(Base):
         String(16), nullable=False, default="text", comment="来源：file/text/url"
     )
     kind: Mapped[str] = mapped_column(
-        String(16), nullable=False, default="doc", comment="类型：doc/3d等"
+        String(16), nullable=False, default="doc", comment="类型：doc/3d/video/image"
     )
     file_type: Mapped[str | None] = mapped_column(String(32), nullable=True, comment="文件扩展名")
     size: Mapped[int | None] = mapped_column(BigInteger, nullable=True, comment="文件大小(字节)")

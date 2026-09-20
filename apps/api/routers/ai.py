@@ -232,6 +232,10 @@ async def ai_chat(
     chat_mode: Literal["fast", "deep"] = bindings["mode"]
     prompt_id: str | None = bindings["promptId"]
     kb_ids_bind: list[str] = list(bindings["knowledgeBaseIds"])
+    if kb_ids_bind:
+        from api.services.knowledge import access as kb_access
+
+        kb_ids_bind = await kb_access.require_usable_ids(db, user, kb_ids_bind)
     tools_enabled: bool = bool(bindings["toolsEnabled"])
     allowed_tool_ids: list[str] | None = bindings["allowedToolIds"]
     agent_id: str | None = bindings["agentId"]

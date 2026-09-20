@@ -18,7 +18,7 @@ class Settings(BaseSettings):
     cors_origins: str = "*"
 
     api_host: str = "0.0.0.0"
-    api_port: int = 8000
+    api_port: int = 8800
     ai_host: str = "0.0.0.0"
     ai_port: int = 8001
     ingest_host: str = "0.0.0.0"
@@ -103,6 +103,24 @@ class Settings(BaseSettings):
     kb_search_candidate_multiplier: int = 4
     # 混合分 = (1-w)*向量分 + w*关键词分；停电/禁令等短查询建议 0.3～0.45
     kb_search_keyword_weight: float = 0.4
+
+    # ---- Knowledge video / ASR ----
+    kb_upload_max_bytes: int = 200 * 1024 * 1024
+    kb_video_upload_max_bytes: int = 512 * 1024 * 1024
+    kb_video_asr_timeout_seconds: int = 7200
+    asr_provider: str = "none"
+    asr_api_base: str = ""
+    asr_api_key: str = ""
+    asr_model: str = "whisper-1"
+    asr_language: str = "zh"
+
+    # ---- Knowledge image / OCR ----
+    ocr_provider: str = "none"
+    ocr_endpoint: str = "ocr-api.cn-hangzhou.aliyuncs.com"
+    ocr_access_key_id: str = ""
+    ocr_access_key_secret: str = ""
+    ocr_type: str = "Advanced"
+    ocr_timeout_seconds: int = 120
 
     @property
     def cors_origin_list(self) -> list[str]:

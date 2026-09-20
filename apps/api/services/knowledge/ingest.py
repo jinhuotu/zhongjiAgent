@@ -11,13 +11,68 @@ from api.services.knowledge.bases import get_base_by_public_id
 from api.services.knowledge.chunking import split_text
 from api.services.knowledge.embeddings import get_embedding_client
 from api.services.knowledge.qdrant_store import get_qdrant_store
+from api.services.knowledge.image_contract import KIND_IMAGE, is_image_ext
+from api.services.knowledge.video_contract import KIND_VIDEO, is_video_ext
 from common.config import get_settings
 from common.errors import AppError, ErrorCode
-from db.models.knowledge import KnowledgeDocument
+from db.models.knowledge import KnowledgeBase, KnowledgeDocument
 
 
 def short_id(n: int = 10) -> str:
     return secrets.token_hex(n)[:n]
+
+
+def _storage_root() -> Path:
+    return Path(get_settings().storage_root).expanduser().resolve()
+
+
+def resolve_storage_path(key: str) -> Path:
+    rel = (key or "").replace("\\", "/").lstrip("/")
+    if not rel or ".." in Path(rel).parts:
+        raise AppError(ErrorCode.BAD_REQUEST, "invalid storage key", status_code=400)
+    root = _storage_root()
+    path = (root / rel).resolve()
+    if not path.is_relative_to(root):
+        raise AppError(ErrorCode.BAD_REQUEST, "invalid storage key", status_code=400)
+    return path
+
+
+def unlink_stored_file(key: str | None) -> None:
+    if not key:
+        return
+    try:
+        path = resolve_storage_path(key)
+    except AppError:
+        return
+    if path.is_file():
+        path.unlink(missing_ok=True)
+
+
+def _extracted_text_key(base_public_id: str, doc_public_id: str) -> str:
+    return f"knowledge/{base_public_id}/{doc_public_id}.txt"
+
+
+def write_extracted_text(base_public_id: str, doc_public_id: str, text: str) -> None:
+    path = resolve_storage_path(_extracted_text_key(base_public_id, doc_public_id))
+    path.parent.mkdir(parents=True, exist_ok=True)
+    path.write_text(text, encoding="utf-8")
+
+
+def read_extracted_text(base_public_id: str, doc_public_id: str) -> str | None:
+    try:
+        path = resolve_storage_path(_extracted_text_key(base_public_id, doc_public_id))
+    except AppError:
+        return None
+    if not path.is_file():
+        return None
+    raw = path.read_text(encoding="utf-8").strip()
+    return raw or None
+
+
+def _error_msg(exc: BaseException) -> str:
+    if isinstance(exc, AppError):
+        return (exc.msg or str(exc))[:500]
+    return str(exc)[:500]
 
 
 def to_kb_item(doc: KnowledgeDocument) -> dict[str, Any]:
@@ -58,6 +113,66 @@ async def list_documents(db: AsyncSession, *, base_public_id: str) -> list[dict[
         setattr(d, "_base_public_id", base.public_id)
         items.append(to_kb_item(d))
     return items
+
+
+async def _vectorize_document(
+    db: AsyncSession,
+    doc: KnowledgeDocument,
+    text: str,
+    *,
+    timed_chunks: list | None = None,
+) -> None:
+    cleaned = text.strip()
+    if len(cleaned) < 4:
+        raise AppError(ErrorCode.VALIDATION, "content too short", status_code=422)
+
+    result = await db.execute(select(KnowledgeBase).where(KnowledgeBase.id == doc.base_id))
+    base = result.scalar_one_or_none()
+    if base is None:
+        raise AppError(ErrorCode.NOT_FOUND, "knowledge base not found", status_code=404)
+
+    meta: list[dict[str, Any]] | None = None
+    if timed_chunks:
+        pieces = [c for c in timed_chunks if getattr(c, "content", None)]
+        chunks = [str(c.content).strip() for c in pieces if str(c.content).strip()]
+        meta = []
+        for c in pieces:
+            if not str(c.content).strip():
+                continue
+            row: dict[str, Any] = {}
+            if getattr(c, "start_ms", None) is not None:
+                row["startMs"] = int(c.start_ms)
+            if getattr(c, "end_ms", None) is not None:
+                row["endMs"] = int(c.end_ms)
+            meta.append(row)
+        if not any(row for row in meta):
+            meta = None
+    else:
+        chunks = split_text(cleaned)
+
+    if not chunks:
+        raise AppError(ErrorCode.VALIDATION, "content too short after chunk", status_code=422)
+
+    embedder = await get_embedding_client(db)
+    vectors = await embedder.embed_documents(chunks)
+    store = get_qdrant_store()
+    store.delete_by_doc_id(doc.public_id)
+    store.upsert_chunks(
+        public_id=doc.public_id,
+        kb_id=base.public_id,
+        name=doc.name,
+        source=doc.source,
+        tags=doc.tags if isinstance(doc.tags, list) else [],
+        chunks=chunks,
+        vectors=vectors,
+        chunk_meta=meta,
+    )
+    doc.char_count = len(cleaned)
+    doc.chunk_count = len(chunks)
+    if not (doc.summary or "").startswith("PERFJSON:"):
+        doc.summary = cleaned[:200]
+    doc.status = "ready"
+    doc.error_msg = None
 
 
 async def ingest_text(
@@ -107,22 +222,7 @@ async def ingest_text(
     await db.flush()
 
     try:
-        chunks = split_text(text)
-        embedder = await get_embedding_client(db)
-        vectors = await embedder.embed_documents(chunks)
-        store = get_qdrant_store()
-        store.upsert_chunks(
-            public_id=public_id,
-            kb_id=base.public_id,
-            name=doc.name,
-            source=doc.source,
-            tags=doc.tags if isinstance(doc.tags, list) else [],
-            chunks=chunks,
-            vectors=vectors,
-        )
-        doc.chunk_count = len(chunks)
-        doc.status = "ready"
-        doc.error_msg = None
+        await _vectorize_document(db, doc, text)
     except Exception as exc:  # noqa: BLE001
         doc.status = "failed"
         doc.error_msg = str(exc)
@@ -163,9 +263,12 @@ async def get_document_preview(
     except Exception:  # noqa: BLE001
         chunks = []
 
+    sidecar = read_extracted_text(base.public_id, doc_public_id)
     parts = [str(c.get("content") or "") for c in chunks if str(c.get("content") or "").strip()]
     content = "\n\n".join(parts).strip()
     truncated = False
+    if sidecar and (not content or len(sidecar) > len(content)):
+        content = sidecar
     if not content and doc.summary:
         content = doc.summary
         truncated = True
@@ -175,7 +278,66 @@ async def get_document_preview(
         "chunks": chunks,
         "content": content,
         "truncated": truncated,
+        "hasFile": bool((doc.file_key or doc.storage_path or "").strip()),
     }
+
+
+_FILE_MIME = {
+    ".txt": "text/plain; charset=utf-8",
+    ".md": "text/markdown; charset=utf-8",
+    ".csv": "text/csv; charset=utf-8",
+    ".json": "application/json",
+    ".pdf": "application/pdf",
+    ".png": "image/png",
+    ".jpg": "image/jpeg",
+    ".jpeg": "image/jpeg",
+    ".webp": "image/webp",
+    ".gif": "image/gif",
+    ".bmp": "image/bmp",
+    ".mp4": "video/mp4",
+    ".webm": "video/webm",
+}
+
+
+def _guess_file_mime(path: Path) -> str:
+    return _FILE_MIME.get(path.suffix.lower(), "application/octet-stream")
+
+
+async def resolve_document_file(
+    db: AsyncSession,
+    *,
+    base_public_id: str,
+    doc_public_id: str,
+) -> tuple[Path, str, str]:
+    """原件落盘路径、下载名、MIME。无原件抛 404（不做 txt 回退）。"""
+    base = await get_base_by_public_id(db, base_public_id)
+    result = await db.execute(
+        select(KnowledgeDocument).where(
+            KnowledgeDocument.public_id == doc_public_id,
+            KnowledgeDocument.base_id == base.id,
+        )
+    )
+    doc = result.scalar_one_or_none()
+    if doc is None:
+        raise AppError(ErrorCode.NOT_FOUND, "文档不存在", status_code=404)
+
+    key = doc.file_key or doc.storage_path
+    if not key:
+        raise AppError(ErrorCode.NOT_FOUND, "文档无原文件", status_code=404)
+    try:
+        path = resolve_storage_path(key)
+    except AppError as exc:
+        raise AppError(ErrorCode.NOT_FOUND, "文档无原文件", status_code=404) from exc
+    if not path.is_file():
+        raise AppError(ErrorCode.NOT_FOUND, "文档无原文件", status_code=404)
+
+    stem = (doc.name or path.stem or doc.public_id).replace("/", "_").replace("\\", "_")
+    suffix = path.suffix or ""
+    if suffix and not stem.lower().endswith(suffix.lower()):
+        name = f"{stem}{suffix}"
+    else:
+        name = path.name or f"{stem}.bin"
+    return path, name, _guess_file_mime(path)
 
 
 async def download_document(
@@ -198,24 +360,14 @@ async def download_document(
 
     key = doc.file_key or doc.storage_path
     if key:
-        path = Path(get_settings().storage_root) / key
-        if path.is_file():
-            name = path.name or f"{doc.name}.bin"
-            suffix = path.suffix.lower()
-            media = {
-                ".txt": "text/plain; charset=utf-8",
-                ".md": "text/markdown; charset=utf-8",
-                ".csv": "text/csv; charset=utf-8",
-                ".json": "application/json",
-                ".pdf": "application/pdf",
-                ".png": "image/png",
-                ".jpg": "image/jpeg",
-                ".jpeg": "image/jpeg",
-                ".webp": "image/webp",
-                ".gif": "image/gif",
-                ".mp4": "video/mp4",
-            }.get(suffix, "application/octet-stream")
-            return path.read_bytes(), name, media
+        try:
+            path = resolve_storage_path(key)
+        except AppError:
+            path = None
+        else:
+            if path.is_file():
+                name = path.name or f"{doc.name}.bin"
+                return path.read_bytes(), name, _guess_file_mime(path)
 
     preview = await get_document_preview(
         db, base_public_id=base_public_id, doc_public_id=doc_public_id
@@ -225,6 +377,84 @@ async def download_document(
         raise AppError(40402, "文档无可导出内容", status_code=404)
     filename = f"{doc.name or doc.public_id}.txt".replace("/", "_").replace("\\", "_")
     return content.encode("utf-8"), filename, "text/plain; charset=utf-8"
+
+
+_PREVIEW_VIDEO = frozenset({"mp4", "webm"})
+_PREVIEW_IMAGE = frozenset({"png", "jpg", "jpeg", "webp", "gif", "bmp"})
+
+
+def _chunk_preview_kind(file_type: str | None, *, has_file: bool) -> str:
+    if not has_file:
+        return ""
+    ext = (file_type or "").lower().lstrip(".")
+    if ext in _PREVIEW_VIDEO:
+        return "video"
+    if ext in _PREVIEW_IMAGE:
+        return "image"
+    return "file" if ext else ""
+
+
+async def _fill_chunk_names(
+    db: AsyncSession, hits: list[dict[str, Any]]
+) -> list[dict[str, Any]]:
+    """用 MySQL 资料名称覆盖/补全 Qdrant payload，聊天引用才带得上名字与视频元数据。"""
+    ids = [str(h.get("doc_id") or "").strip() for h in hits]
+    ids = [x for x in ids if x]
+    if not ids:
+        return hits
+    result = await db.execute(
+        select(
+            KnowledgeDocument.public_id,
+            KnowledgeDocument.name,
+            KnowledgeDocument.file_type,
+            KnowledgeDocument.file_key,
+            KnowledgeDocument.storage_path,
+            KnowledgeDocument.tags,
+            KnowledgeDocument.kind,
+        ).where(KnowledgeDocument.public_id.in_(ids))
+    )
+    rows = {
+        str(pid): (
+            name,
+            (ft or "").strip().lower(),
+            bool((file_key or storage_path or "").strip()),
+            tags if isinstance(tags, list) else [],
+            (kind or "").strip().lower(),
+        )
+        for pid, name, ft, file_key, storage_path, tags, kind in result.all()
+    }
+    out: list[dict[str, Any]] = []
+    for h in hits:
+        item = dict(h)
+        pid = str(item.get("doc_id") or "").strip()
+        name, ft, has_file, tags, kind = rows.get(pid, ("", "", False, [], ""))
+        if name:
+            item["name"] = name
+        elif not str(item.get("name") or "").strip():
+            item["name"] = "未命名资料"
+        item["file_type"] = ft or str(item.get("file_type") or "")
+        item["has_file"] = has_file
+        if kind:
+            item["kind"] = kind
+        elif is_video_ext(item["file_type"]):
+            item["kind"] = KIND_VIDEO
+        elif is_image_ext(item["file_type"]):
+            item["kind"] = KIND_IMAGE
+        item["preview_kind"] = _chunk_preview_kind(item["file_type"], has_file=has_file)
+        if item.get("startMs") is not None:
+            try:
+                item["startMs"] = int(item["startMs"])
+            except (TypeError, ValueError):
+                item.pop("startMs", None)
+        if item.get("endMs") is not None:
+            try:
+                item["endMs"] = int(item["endMs"])
+            except (TypeError, ValueError):
+                item.pop("endMs", None)
+        if not item.get("tags") and tags:
+            item["tags"] = tags
+        out.append(item)
+    return out
 
 
 async def search_chunks(
@@ -257,9 +487,10 @@ async def search_chunks(
         kb_id=kb_id,
         kb_ids=kb_ids,
     )
-    return hybrid_rerank(
+    ranked = hybrid_rerank(
         q,
         hits,
         top_k=top_k,
         keyword_weight=float(settings.kb_search_keyword_weight),
     )
+    return await _fill_chunk_names(db, ranked)

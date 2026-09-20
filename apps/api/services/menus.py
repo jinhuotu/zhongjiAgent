@@ -1,10 +1,11 @@
-"""菜单权限：按角色返回可访问的导航 href（与前端 nav 对齐）。"""
+"""菜单权限：按角色白名单返回可访问的导航 href。管理页只给管理员。"""
 
 from __future__ import annotations
 
+from typing import Any, Iterable
+
 from db.models.user import User
 
-# 仅管理员可见
 ADMIN_ONLY_MENUS = frozenset(
     {
         "/scene-agents",
@@ -17,7 +18,6 @@ ADMIN_ONLY_MENUS = frozenset(
     }
 )
 
-# 全站菜单目录（与 zhongjivueweb/src/config/nav.ts 对齐的核心路径）
 ALL_MENUS: tuple[str, ...] = (
     "/",
     "/realtime",
@@ -67,6 +67,7 @@ ALL_MENUS: tuple[str, ...] = (
     "/quality/overview",
     "/quality/realtime",
     "/quality/prediction",
+    "/quality/procurement",
     "/quality/models",
     "/quality/correlation",
     "/quality/trace",
@@ -101,38 +102,53 @@ ALL_MENUS: tuple[str, ...] = (
     "/settings",
 )
 
-# 非管理员角色的菜单白名单（取并集）；未列出的角色默认「全站减去 adminOnly」
-ROLE_MENU_ALLOW: dict[str, frozenset[str]] = {
-    "operator": frozenset(
-        {
-            "/",
-            "/realtime",
-            "/furnaces",
-            "/production/tunnel",
-            "/production/batching",
-            "/production/shuttle",
-            "/alerts",
-            "/ai-chat",
-            "/knowledge",
-        }
+BUSINESS_MENUS: tuple[str, ...] = tuple(h for h in ALL_MENUS if h not in ADMIN_ONLY_MENUS)
+
+DEFAULT_NEW_ROLE_MENUS: tuple[str, ...] = ("/", "/ai-chat")
+
+SEED_ROLE_MENUS: dict[str, tuple[str, ...]] = {
+    "operator": (
+        "/",
+        "/realtime",
+        "/furnaces",
+        "/production/tunnel",
+        "/production/batching",
+        "/production/shuttle",
+        "/alerts",
+        "/ai-chat",
+        "/knowledge",
     ),
-    "auditor": frozenset(
-        {
-            "/",
-            "/realtime",
-            "/reports",
-            "/ai-reports",
-            "/alerts",
-            "/carbon",
-            "/verification",
-            "/product-footprint",
-            "/energy",
-            "/furnaces",
-            "/knowledge",
-            "/ai-chat",
-        }
+    "auditor": (
+        "/",
+        "/realtime",
+        "/reports",
+        "/ai-reports",
+        "/alerts",
+        "/carbon",
+        "/verification",
+        "/product-footprint",
+        "/energy",
+        "/furnaces",
+        "/knowledge",
+        "/ai-chat",
     ),
+    "energy_director": BUSINESS_MENUS,
+    "carbon_manager": BUSINESS_MENUS,
+    "engineer": BUSINESS_MENUS,
 }
+
+_MENU_FAMILIES: tuple[tuple[str, ...], ...] = (
+    ("/casting-yield", "/casting-peel", "/casting-qa-month"),
+    ("/quality/prediction", "/quality/procurement"),
+)
+
+
+def expand_menu_families(menus: list[str]) -> list[str]:
+    merged = set(menus)
+    for family in _MENU_FAMILIES:
+        if any(h in merged for h in family):
+            merged.update(family)
+    return _sort_menus(merged)
 
 
 def user_is_admin(user: User) -> bool:
@@ -141,30 +157,60 @@ def user_is_admin(user: User) -> bool:
     return any(getattr(r, "code", None) == "admin" for r in (user.roles or []))
 
 
+def _sort_menus(hrefs: Iterable[str]) -> list[str]:
+    uniq = {h for h in hrefs if h}
+    return sorted(uniq, key=lambda h: ALL_MENUS.index(h) if h in ALL_MENUS else 999)
+
+
+def sanitize_role_menus(raw: Any) -> list[str]:
+    seen: set[str] = set()
+    out: list[str] = []
+    if isinstance(raw, (list, tuple)):
+        for item in raw:
+            href = str(item or "").strip()
+            if not href or href in seen:
+                continue
+            if href not in ALL_MENUS or href in ADMIN_ONLY_MENUS:
+                continue
+            seen.add(href)
+            out.append(href)
+    if "/" not in seen:
+        out.insert(0, "/")
+    return expand_menu_families(_sort_menus(out))
+
+
+def menus_of_role(role: Any) -> list[str]:
+    code = getattr(role, "code", None)
+    if code == "admin":
+        return list(ALL_MENUS)
+    raw = getattr(role, "menus", None)
+    if isinstance(raw, list) and raw:
+        return sanitize_role_menus(raw)
+    if code in SEED_ROLE_MENUS:
+        return list(SEED_ROLE_MENUS[code])
+    return ["/"]
+
+
 def resolve_menus(user: User) -> list[str]:
     """返回用户可访问的菜单 href 列表。"""
     if user_is_admin(user):
         return list(ALL_MENUS)
 
-    role_codes = {getattr(r, "code", None) for r in (user.roles or [])}
-    role_codes.discard(None)
-
-    restricted = [ROLE_MENU_ALLOW[c] for c in role_codes if c in ROLE_MENU_ALLOW]
-    if restricted:
-        allowed: set[str] = set()
-        for s in restricted:
-            allowed |= set(s)
-        return sorted(allowed, key=lambda h: ALL_MENUS.index(h) if h in ALL_MENUS else 999)
-
-    # 默认业务角色：可见非 adminOnly 菜单
-    return [h for h in ALL_MENUS if h not in ADMIN_ONLY_MENUS]
+    allowed: set[str] = set()
+    for role in user.roles or []:
+        if getattr(role, "code", None) == "admin":
+            return list(ALL_MENUS)
+        allowed.update(menus_of_role(role))
+    allowed -= ADMIN_ONLY_MENUS
+    if not allowed:
+        return ["/"]
+    return expand_menu_families(_sort_menus(allowed))
 
 
 def can_access_menu(user: User, href: str) -> bool:
     menus = set(resolve_menus(user))
     if href in menus:
         return True
-    # 详情页：前缀匹配（如 /knowledge/:id）
     for m in menus:
         if m != "/" and href.startswith(m + "/"):
             return True

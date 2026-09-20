@@ -76,7 +76,28 @@ services:
       timeout: 5s
       retries: 10
 
+  # 知识库视频 ASR（OpenAI 兼容 /v1/audio/transcriptions）
+  # 启动：docker compose -f deploy/docker-compose.yml --profile asr up -d whisper
+  # 宿主机 19100，避开 weitai-whisper 占用的 19000；容器内仍为 9000
+  whisper:
+    image: hwdsl2/whisper-server:latest
+    container_name: zhongji-whisper
+    restart: unless-stopped
+    profiles: ["asr"]
+    ports:
+      - "19100:9000"
+    environment:
+      WHISPER_MODEL: base
+      WHISPER_LANGUAGE: zh
+      WHISPER_DEVICE: cpu
+      WHISPER_COMPUTE_TYPE: int8
+      WHISPER_THREADS: "4"
+      WHISPER_API_KEY: zhongji-dev-whisper
+    volumes:
+      - whisper_data:/var/lib/whisper
+
 volumes:
   mysql_data:
   redis_data:
   qdrant_data:
+  whisper_data:

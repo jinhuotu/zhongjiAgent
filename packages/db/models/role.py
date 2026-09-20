@@ -4,6 +4,7 @@ from datetime import datetime
 from typing import TYPE_CHECKING
 
 from sqlalchemy import BigInteger, DateTime, ForeignKey, String, Text, UniqueConstraint, func
+from sqlalchemy.dialects.mysql import JSON
 from sqlalchemy.orm import Mapped, mapped_column, relationship
 
 from db.base import Base
@@ -22,6 +23,7 @@ class Role(Base):
     code: Mapped[str] = mapped_column(String(64), unique=True, nullable=False, comment="角色编码")
     name: Mapped[str] = mapped_column(String(64), nullable=False, comment="角色名称")
     description: Mapped[str | None] = mapped_column(Text, nullable=True, comment="角色说明")
+    menus: Mapped[list | None] = mapped_column(JSON, nullable=True, comment="可访问菜单 href 列表")
     created_at: Mapped[datetime] = mapped_column(
         DateTime(timezone=True),
         server_default=func.now(),

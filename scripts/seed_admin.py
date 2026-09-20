@@ -22,10 +22,17 @@ sys.path.insert(0, str(ROOT / "apps"))
 
 from sqlalchemy import select
 
+from api.services.menus import BUSINESS_MENUS, SEED_ROLE_MENUS
 from common.security import hash_password
 from db.models.role import Role, UserRole
 from db.models.user import User
 from db.session import AsyncSessionLocal
+
+
+def _menus_for_seed_role(code: str) -> list[str] | None:
+    if code == "admin":
+        return None
+    return list(SEED_ROLE_MENUS.get(code, BUSINESS_MENUS))
 
 SEED_USERNAME = "admin"
 SEED_PASSWORD = "Admin@123456"
@@ -50,13 +57,20 @@ async def seed() -> None:
             role_result = await db.execute(select(Role).where(Role.code == code))
             role = role_result.scalar_one_or_none()
             if role is None:
-                role = Role(code=code, name=name, description=description)
+                role = Role(
+                    code=code,
+                    name=name,
+                    description=description,
+                    menus=_menus_for_seed_role(code),
+                )
                 db.add(role)
                 await db.flush()
                 print(f"[ok] created role: {code}")
             else:
                 role.name = name
                 role.description = description
+                if code != "admin" and not role.menus:
+                    role.menus = _menus_for_seed_role(code)
                 print(f"[ok] updated role: {code}")
             role_by_code[code] = role
 

@@ -27,6 +27,21 @@ from common.logging import get_logger
 logger = get_logger(__name__)
 
 
+def _time_fields(payload: dict[str, Any]) -> dict[str, int]:
+    out: dict[str, int] = {}
+    if payload.get("startMs") is not None:
+        try:
+            out["startMs"] = int(payload["startMs"])
+        except (TypeError, ValueError):
+            pass
+    if payload.get("endMs") is not None:
+        try:
+            out["endMs"] = int(payload["endMs"])
+        except (TypeError, ValueError):
+            pass
+    return out
+
+
 
 
 
@@ -144,11 +159,17 @@ class QdrantKnowledgeStore:
 
         vectors: list[list[float]],
 
+        chunk_meta: list[dict[str, Any]] | None = None,
+
     ) -> list[str]:
 
         if len(chunks) != len(vectors):
 
             raise AppError(ErrorCode.INTERNAL, "chunks/vectors size mismatch", status_code=500)
+
+        if chunk_meta is not None and len(chunk_meta) != len(chunks):
+
+            raise AppError(ErrorCode.INTERNAL, "chunk_meta size mismatch", status_code=500)
 
         self.ensure_collection(len(vectors[0]))
 
@@ -162,6 +183,34 @@ class QdrantKnowledgeStore:
 
             point_ids.append(pid)
 
+            payload: dict[str, Any] = {
+
+                "doc_id": public_id,
+
+                "kb_id": kb_id,
+
+                "name": name,
+
+                "source": source,
+
+                "chunk_index": idx,
+
+                "content": content,
+
+                "tags": tags or [],
+
+            }
+
+            meta = (chunk_meta[idx] if chunk_meta else None) or {}
+
+            if meta.get("startMs") is not None:
+
+                payload["startMs"] = int(meta["startMs"])
+
+            if meta.get("endMs") is not None:
+
+                payload["endMs"] = int(meta["endMs"])
+
             points.append(
 
                 qm.PointStruct(
@@ -170,23 +219,7 @@ class QdrantKnowledgeStore:
 
                     vector=vector,
 
-                    payload={
-
-                        "doc_id": public_id,
-
-                        "kb_id": kb_id,
-
-                        "name": name,
-
-                        "source": source,
-
-                        "chunk_index": idx,
-
-                        "content": content,
-
-                        "tags": tags or [],
-
-                    },
+                    payload=payload,
 
                 )
 
@@ -230,12 +263,12 @@ class QdrantKnowledgeStore:
             )
             for point in points:
                 payload = point.payload or {}
-                out.append(
-                    {
-                        "chunkIndex": int(payload.get("chunk_index") or 0),
-                        "content": str(payload.get("content") or ""),
-                    }
-                )
+                item: dict[str, Any] = {
+                    "chunkIndex": int(payload.get("chunk_index") or 0),
+                    "content": str(payload.get("content") or ""),
+                }
+                item.update(_time_fields(payload))
+                out.append(item)
             if offset is None or not points:
                 break
 
@@ -399,6 +432,8 @@ class QdrantKnowledgeStore:
                     "chunk_index": payload.get("chunk_index"),
 
                     "tags": payload.get("tags") or [],
+
+                    **_time_fields(payload),
 
                 }
 

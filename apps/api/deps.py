@@ -1,7 +1,6 @@
 from typing import Annotated
 
-from fastapi import Depends, Header
-from fastapi.security import HTTPAuthorizationCredentials, HTTPBearer
+from fastapi import Depends, Header, Request
 from sqlalchemy import select
 from sqlalchemy.ext.asyncio import AsyncSession
 
@@ -10,27 +9,28 @@ from common.security import decode_token
 from db.models.user import User
 from db.session import get_db
 
-bearer_scheme = HTTPBearer(auto_error=False)
-
 DbSession = Annotated[AsyncSession, Depends(get_db)]
 
 
 async def get_current_user(
+    request: Request,
     db: DbSession,
-    credentials: Annotated[
-        HTTPAuthorizationCredentials | None,
-        Depends(bearer_scheme),
-    ] = None,
 ) -> User:
-    if credentials is None or not credentials.credentials:
-        raise AppError(ErrorCode.UNAUTHORIZED, "missing access token", status_code=401)
-    try:
-        payload = decode_token(credentials.credentials)
-    except ValueError as exc:
-        raise AppError(ErrorCode.UNAUTHORIZED, "invalid access token", status_code=401) from exc
-    if payload.get("type") != "access":
-        raise AppError(ErrorCode.UNAUTHORIZED, "token type must be access", status_code=401)
-    username = payload.get("sub")
+    """解析 access token。不走 HTTPBearer，避免 multipart / <video src> 被误判未登录。"""
+    from api.middleware.auth import access_token_from_request
+
+    username = str(getattr(request.state, "jwt_sub", "") or "").strip()
+    if not username:
+        raw = access_token_from_request(request)
+        if not raw:
+            raise AppError(ErrorCode.UNAUTHORIZED, "missing access token", status_code=401)
+        try:
+            payload = decode_token(raw)
+        except ValueError as exc:
+            raise AppError(ErrorCode.UNAUTHORIZED, "invalid access token", status_code=401) from exc
+        if payload.get("type") != "access":
+            raise AppError(ErrorCode.UNAUTHORIZED, "token type must be access", status_code=401)
+        username = str(payload.get("sub") or "").strip()
     if not username:
         raise AppError(ErrorCode.UNAUTHORIZED, "invalid token subject", status_code=401)
     result = await db.execute(select(User).where(User.username == username))

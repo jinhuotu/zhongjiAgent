@@ -5,7 +5,7 @@ import httpx
 
 
 async def main() -> None:
-    async with httpx.AsyncClient(base_url="http://127.0.0.1:8000", timeout=60.0) as client:
+    async with httpx.AsyncClient(base_url="http://127.0.0.1:8800", timeout=60.0) as client:
         login = await client.post(
             "/api/v1/auth/login",
             json={"username": "admin", "password": "Admin@123456"},

@@ -7,7 +7,7 @@ from db.models.chat import ChatMessage, ChatSession
 from db.models.furnace import Furnace, KilnProcessSample
 from db.models.governance import GovTask
 from db.models.hot_config import HotConfig, HotConfigAudit
-from db.models.knowledge import KnowledgeBase, KnowledgeDocument
+from db.models.knowledge import KnowledgeBase, KnowledgeBaseAcl, KnowledgeDocument
 from db.models.mcp import McpServer, McpTool
 from db.models.model_config import ModelConfig
 from db.models.production import ProdAlarm, ProdCommand, ProdSample, ProdSystem, ProdTag
@@ -21,6 +21,7 @@ __all__ = [
     "Role",
     "UserRole",
     "KnowledgeBase",
+    "KnowledgeBaseAcl",
     "KnowledgeDocument",
     "ChatSession",
     "ChatMessage",

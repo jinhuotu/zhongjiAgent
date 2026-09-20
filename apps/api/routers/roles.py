@@ -24,6 +24,7 @@ async def roles_create(body: CreateRoleRequest, db: DbSession, admin: AdminUser)
         db,
         name=body.name,
         description=body.description,
+        menus=body.menus,
     )
     return ok({"item": item})
 
@@ -41,6 +42,7 @@ async def roles_update(
         role_id=role_id,
         name=body.name,
         description=body.description,
+        menus=body.menus,
         fields_set=set(body.model_fields_set),
     )
     return ok({"item": item})

@@ -8,6 +8,7 @@ from sqlalchemy import func, select
 from sqlalchemy.ext.asyncio import AsyncSession
 from sqlalchemy.orm import noload, selectinload
 
+from api.services.menus import DEFAULT_NEW_ROLE_MENUS, menus_of_role, sanitize_role_menus
 from common.errors import AppError, ErrorCode
 from common.security import hash_password
 from db.models.role import Role, UserRole
@@ -67,6 +68,7 @@ def to_role_item(role: Role, user_count: int = 0) -> dict[str, Any]:
         "code": role.code,
         "name": role.name,
         "description": role.description,
+        "menus": menus_of_role(role),
         "userCount": user_count,
         "createdAt": _ts_ms(role.created_at) or 0,
         "updatedAt": _ts_ms(role.updated_at) or 0,
@@ -104,6 +106,7 @@ async def create_role(
     *,
     name: str,
     description: str | None,
+    menus: list[str] | None = None,
 ) -> dict[str, Any]:
     name = (name or "").strip()
     if not name:
@@ -114,6 +117,7 @@ async def create_role(
         code=code,
         name=name,
         description=(description or "").strip() or None,
+        menus=sanitize_role_menus(menus if menus is not None else list(DEFAULT_NEW_ROLE_MENUS)),
     )
     db.add(role)
     await db.flush()
@@ -128,6 +132,7 @@ async def update_role(
     role_id: int,
     name: str | None = None,
     description: str | None = None,
+    menus: list[str] | None = None,
     fields_set: set[str] | None = None,
 ) -> dict[str, Any]:
     fields_set = fields_set or set()
@@ -141,6 +146,9 @@ async def update_role(
 
     if "description" in fields_set:
         role.description = (description or "").strip() or None
+
+    if "menus" in fields_set and role.code not in _PROTECTED_ROLE_CODES:
+        role.menus = sanitize_role_menus(menus)
 
     await db.commit()
     role = await get_role(db, role.id)

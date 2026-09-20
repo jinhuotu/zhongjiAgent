@@ -45,7 +45,7 @@ def main() -> None:
     worker_cmd = [sys.executable, str(ROOT / "workers" / "stream_consumer_main.py")]
 
     print("=== zhongji-dev ===")
-    print("API    → python -m api.main (:8000，DEBUG 时热重载)")
+    print("API    → python -m api.main (:8800，DEBUG 时热重载)")
     print("Worker → stream_consumer_main (Stream 归档 + TTL 定时任务，无热重载)")
     print("Ctrl+C 结束两个进程。\n")
 

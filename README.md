@@ -1,18 +1,18 @@
 # 工业燃气车式窑数字化能碳管控平台 — 后端（zhongji-agent）
 
-Poetry 单体多模块后端。前端工程：`zhongjivueweb`（Vue 3，默认联调 `http://127.0.0.1:8000`）。
+Poetry 单体多模块后端。前端工程：`zhongjivueweb`（Vue 3，默认联调 `http://127.0.0.1:8800`）。
 
 详细现状与接口说明见：
 
 - [`docs/开发文档.md`](docs/开发文档.md)
 - [`docs/chat-memory.md`](docs/chat-memory.md)（对话 Redis 热记忆 / Stream 归档）
-- [`docs/生产部署.md`](docs/生产部署.md)（轻量云主机生产部署与排障）
+- [`docs/生产部署.md`](docs/生产部署.md)（阿里云 ECS：优祺 / 中机 / 伟泰同机部署与排障）
 
 ## 目录结构
 
 ```
 apps/
-  api/             # 主业务 FastAPI（:8000）
+  api/             # 主业务 FastAPI（:8800）
   ai/              # AI 侧车占位（:8001）
   ingest/          # 采集占位（:8002）
   model_server/    # ONNX 占位（:8003）
@@ -54,7 +54,7 @@ poetry run zhongji-dev
 **或分两个终端（生产形态一致）：**
 
 ```powershell
-poetry run zhongji-api          # 主 API :8000
+poetry run zhongji-api          # 主 API :8800
 poetry run zhongji-chat-worker  # 对话异步归档（测智能问答时必开）
 ```
 
@@ -67,13 +67,13 @@ poetry run zhongji-chat-worker  # 对话异步归档（测智能问答时必开�
 > 生产 / Docker 请分容器部署，不要把 Worker 嵌进 FastAPI BackgroundTasks。  
 > Compose Worker：`docker compose -f deploy/docker-compose.yml --profile workers up -d chat-consumer-worker`
 
-Swagger：http://127.0.0.1:8000/docs
+Swagger：http://127.0.0.1:8800/docs
 
 ### 前端
 
 ```powershell
 # zhongjivueweb/.env
-VITE_API_BASE_URL=http://127.0.0.1:8000
+VITE_API_BASE_URL=http://127.0.0.1:8800
 npm run dev
 ```
 
@@ -82,7 +82,7 @@ npm run dev
 ## 已具备能力（摘要）
 
 - JWT 登录 / 用户与角色管理 / 模型管理（DB 配置）
-- 知识库 RAG（MySQL 元数据 + Qdrant）
+- 知识库 RAG（MySQL 元数据 + Qdrant）；视频 ASR 转写 / 图片 RapidOCR 后文本检索，问答可回放原片、点击预览原图
 - 提示词 / MCP / **场景智能体**（配置包 + 对话 `agentId`）
 - AI 对话：服务端 Redis 窗口上下文 + SSE；异步 Stream 落库
 - 对话 M2：限流、会话锁、Embedding 缓存、滚动裁剪、长期记忆摘要、热配置 Hash、TTL 兜底

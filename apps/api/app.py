@@ -48,6 +48,22 @@ async def _lifespan(_app: FastAPI):
         )
     except Exception:  # noqa: BLE001
         logging.getLogger("api.app").exception("audit purge on startup failed")
+    try:
+        from api.services.knowledge.video import reclaim_parsing_videos, start_video_worker
+
+        start_video_worker()
+        n = await reclaim_parsing_videos()
+        logging.getLogger("api.app").info("kb video worker started requeued=%s", n)
+    except Exception:  # noqa: BLE001
+        logging.getLogger("api.app").exception("kb video worker start failed")
+    try:
+        from api.services.knowledge.image import reclaim_parsing_images, start_image_worker
+
+        start_image_worker()
+        n = await reclaim_parsing_images()
+        logging.getLogger("api.app").info("kb image worker started requeued=%s", n)
+    except Exception:  # noqa: BLE001
+        logging.getLogger("api.app").exception("kb image worker start failed")
     yield
 
 

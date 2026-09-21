@@ -2384,8 +2384,8 @@ def _filesystem_root_from_server(server: McpServer) -> str | None:
     return None
 
 
-def _safe_export_filename(*, name: str, code: str = "") -> str:
-    """导出文件名：{物料名称}_良率分析.md（Windows 非法字符替换）。"""
+def _safe_export_filename(*, name: str, code: str = "", ext: str = ".docx") -> str:
+    """导出文件名：{物料名称}_良率分析.docx（Windows 非法字符替换）。"""
 
     def scrub(s: str) -> str:
         invalid = '<>:"/\\|?*'
@@ -2400,8 +2400,9 @@ def _safe_export_filename(*, name: str, code: str = "") -> str:
             text = text.replace("__", "_")
         return text[:80] or ""
 
+    suffix = ext if ext.startswith(".") else f".{ext}"
     title = scrub(name) or scrub(code) or "未命名物料"
-    return f"{title}_良率分析.md"
+    return f"{title}_良率分析{suffix}"
 
 
 async def find_filesystem_server(db: AsyncSession) -> McpServer:
@@ -2439,7 +2440,7 @@ async def export_markdown_via_filesystem(
     inventory_name: str | None = None,
     inventory_code: str | None = None,
 ) -> dict[str, Any]:
-    """把 Markdown 写到 filesystem MCP 允许目录。"""
+    """把 Word 文档写到 filesystem MCP 允许目录（可选运维留档）。"""
     from pathlib import Path
 
     text = (markdown or "").strip()
@@ -2455,19 +2456,20 @@ async def export_markdown_via_filesystem(
             status_code=422,
         )
 
-    filename = _safe_export_filename(
-        name=str(inventory_name or ""),
-        code=str(inventory_code or ""),
+    binary, filename = build_yield_docx(
+        markdown=text,
+        inventory_name=inventory_name,
+        inventory_code=inventory_code,
     )
     abs_path = str(Path(root) / filename)
     # 规范化分隔符，便于 Windows filesystem MCP 校验
     abs_path = abs_path.replace("/", "\\") if ":" in abs_path[:3] else abs_path
 
-    # 优先本机直写，避开 Windows 下 filesystem stdio MCP 关闭卡住 / 空 JSON
+    # 优先本机直写；Word 为二进制，不再走文本型 MCP write_file
     try:
         out = Path(abs_path)
         out.parent.mkdir(parents=True, exist_ok=True)
-        out.write_text(text, encoding="utf-8")
+        out.write_bytes(binary)
         return {
             "ok": True,
             "path": abs_path,
@@ -2479,31 +2481,32 @@ async def export_markdown_via_filesystem(
             "via": "local",
         }
     except OSError as exc:
-        logger.warning("casting.yield local write failed, fallback MCP: %s", exc)
-
-    result = await mcp_servers.call_tool_on_server(
-        db,
-        server_public_id=server.public_id,
-        tool_name="write_file",
-        arguments={"path": abs_path, "content": text},
-        timeout_seconds=60.0,
-    )
-    if result.get("isError"):
+        logger.warning("casting.yield local write failed: %s", exc)
         raise AppError(
             ErrorCode.INTERNAL,
-            f"写入本地文件失败：{result.get('content')}",
+            f"写入本地 Word 失败（无法直写 {abs_path}）：{exc}",
             status_code=502,
-        )
-    return {
-        "ok": True,
-        "path": abs_path,
-        "filename": filename,
-        "root": root,
-        "serverId": server.public_id,
-        "serverName": server.name,
-        "message": f"已写入 {abs_path}",
-        "mcpContent": result.get("content"),
-    }
+        ) from exc
+
+
+def build_yield_docx(
+    *,
+    markdown: str,
+    inventory_name: str | None = None,
+    inventory_code: str | None = None,
+) -> tuple[bytes, str]:
+    """Markdown → docx 字节与安全文件名。"""
+    from api.services.casting.md_docx import markdown_to_docx_bytes
+
+    text = (markdown or "").strip()
+    if not text:
+        raise AppError(ErrorCode.VALIDATION, "markdown empty", status_code=422)
+    filename = _safe_export_filename(
+        name=str(inventory_name or ""),
+        code=str(inventory_code or ""),
+        ext=".docx",
+    )
+    return markdown_to_docx_bytes(text), filename
 
 
 async def execute_mes_query(
@@ -4120,11 +4123,11 @@ async def generate_yield_document(
         except AppError as exc:
             logger.warning("casting.yield export_filesystem failed: %s", exc)
             file_export = {"ok": False, "error": str(getattr(exc, "msg", None) or exc)}
-            warnings.append(f"本地 Markdown 导出失败：{file_export.get('error')}")
+            warnings.append(f"本地 Word 导出失败：{file_export.get('error')}")
         except Exception as exc:  # noqa: BLE001
             logger.exception("casting.yield export_filesystem failed")
             file_export = {"ok": False, "error": str(exc)}
-            warnings.append(f"本地 Markdown 导出失败：{exc}")
+            warnings.append(f"本地 Word 导出失败：{exc}")
 
     await _emit_progress(
         progress, step="document", label="正在生成文档", status="done"

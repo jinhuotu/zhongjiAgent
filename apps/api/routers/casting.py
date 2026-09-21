@@ -5,8 +5,10 @@ from __future__ import annotations
 import asyncio
 import json
 from typing import Any, Self
+from urllib.parse import quote
 
 from fastapi import APIRouter, File, Form, UploadFile
+from fastapi.responses import Response
 from pydantic import BaseModel, Field, model_validator
 from sse_starlette.event import ServerSentEvent
 from sse_starlette.sse import EventSourceResponse
@@ -46,6 +48,10 @@ _DOCUMENT_DONE_KEYS = (
     "query",
 )
 
+_DOCX_MEDIA = (
+    "application/vnd.openxmlformats-officedocument.wordprocessingml.document"
+)
+
 
 class YieldDocumentBody(BaseModel):
     inventoryGuid: str | None = Field(default=None, max_length=64)
@@ -60,8 +66,8 @@ class YieldDocumentBody(BaseModel):
         default=None, description="若传入则把 Markdown 写入该知识库"
     )
     exportToFilesystem: bool = Field(
-        default=True,
-        description="是否通过 filesystem MCP 将 Markdown 写入本地目录（如 E:/download）",
+        default=False,
+        description="是否额外写入服务器 filesystem 目录（默认关闭；浏览器下载走 export-docx）",
     )
     mode: str = Field(default="deep", description="fast|deep")
     rawContext: str | None = Field(
@@ -87,6 +93,16 @@ class YieldDocumentBody(BaseModel):
             raise ValueError("inventoryGuid 或 query 至少填一个")
         return self
 
+
+class YieldDocxExportBody(BaseModel):
+    markdown: str = Field(..., min_length=1, description="已生成的良率分析 Markdown")
+    inventoryName: str | None = Field(default=None, max_length=200)
+    inventoryCode: str | None = Field(default=None, max_length=64)
+    filename: str | None = Field(
+        default=None,
+        max_length=200,
+        description="可选自定义文件名（含或不含 .docx）",
+    )
 
 def _exc_msg(exc: BaseException) -> str:
     """httpx/anyio 等异常 str() 经常是空串，前端会误显示成「分析失败」。"""
@@ -343,7 +359,7 @@ async def casting_yield_document(
     db: DbSession,
     user: CurrentUser,
 ) -> dict:
-    """分析 + 生成最优良率 Markdown；默认写入本地 filesystem。"""
+    """分析 + 生成最优良率 Markdown；默认不写服务器磁盘（浏览器下载走 export-docx）。"""
     data = await yield_svc.generate_yield_document(
         db,
         inventory_guid=body.inventoryGuid,
@@ -360,6 +376,33 @@ async def casting_yield_document(
         insights=body.insights,
     )
     return ok(data)
+
+
+@router.post("/yield-document/export-docx")
+async def casting_yield_document_export_docx(
+    body: YieldDocxExportBody,
+    user: CurrentUser,
+) -> Response:
+    """把已生成的 Markdown 转为 Word，供浏览器下载。"""
+    _ = user
+    data, filename = yield_svc.build_yield_docx(
+        markdown=body.markdown,
+        inventory_name=body.inventoryName,
+        inventory_code=body.inventoryCode,
+    )
+    custom = (body.filename or "").strip()
+    if custom:
+        safe = "".join(
+            "_" if ch in '<>:"/\\|?*' or ord(ch) < 32 else ch for ch in custom
+        ).strip(" .")
+        if safe:
+            filename = safe if safe.lower().endswith(".docx") else f"{safe}.docx"
+    disposition = f"attachment; filename*=UTF-8''{quote(filename)}"
+    return Response(
+        content=data,
+        media_type=_DOCX_MEDIA,
+        headers={"Content-Disposition": disposition},
+    )
 
 
 @router.post("/yield-document/stream")
@@ -388,7 +431,7 @@ async def casting_yield_document_stream(
                 include_weather=True,
                 prompt_id=body.promptId,
                 knowledge_base_id=None,
-                export_to_filesystem=True,
+                export_to_filesystem=body.exportToFilesystem,
                 mode=body.mode,
                 uploader=user.display_name or user.username,
                 progress=_queued_progress(queue),
@@ -418,7 +461,6 @@ async def casting_yield_document_stream(
     return EventSourceResponse(
         _iter_sse(queue, runner, cancel_on_disconnect=False)
     )
-
 
 @router.post("/peel-report")
 async def casting_peel_report(

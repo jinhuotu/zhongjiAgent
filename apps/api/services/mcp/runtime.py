@@ -7,6 +7,7 @@ from typing import Any
 
 from sqlalchemy.ext.asyncio import AsyncSession
 
+from api.services import audit as audit_svc
 from api.services.ai import memory as memory_svc
 from api.services.ai.llm import LLMClient
 from api.services.mcp import servers as mcp_svc
@@ -92,6 +93,8 @@ async def run_chat_with_mcp(
     chunks: list[dict[str, Any]],  # noqa: ARG001 — 预留 refs 透传
     tools_enabled: bool = True,
     allowed_tool_ids: list[str] | None = None,
+    operator_username: str | None = None,
+    request_id: str = "",
 ) -> AsyncIterator[dict[str, str]]:
     """带 MCP 工具循环的对话生成器，产出 SSE event dict。
 
@@ -152,6 +155,8 @@ async def run_chat_with_mcp(
             kb_ids=kb_ids,
             pool=pool,
             allowed_openai_names=allowed_openai_names,
+            operator_username=operator_username,
+            request_id=request_id,
         ):
             yield ev
     finally:
@@ -170,6 +175,8 @@ async def _run_tool_loop(
     kb_ids: list[str],
     pool: McpSessionPool,
     allowed_openai_names: set[str] | None = None,
+    operator_username: str | None = None,
+    request_id: str = "",
 ) -> AsyncIterator[dict[str, str]]:
     accumulated = ""
 
@@ -304,6 +311,19 @@ async def _run_tool_loop(
                 display_name,
                 bool(tool_error),
                 duration_ms,
+            )
+            await audit_svc.record_data_query(
+                source="mcp",
+                query_text=display_name,
+                tool_name=display_name,
+                params=arguments,
+                result_summary=tool_error or tool_content,
+                success=not bool(tool_error),
+                duration_ms=duration_ms,
+                operator_id=user_id,
+                operator_username=operator_username,
+                session_id=str(getattr(session, "public_id", "") or "") or None,
+                request_id=request_id,
             )
 
             tool_hot = memory_svc.build_hot_message(

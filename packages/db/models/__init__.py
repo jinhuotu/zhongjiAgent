@@ -1,7 +1,7 @@
 from db.models.agent import ScenarioAgent
 from db.models.ai_report import AiReport
 from db.models.alert import AlertRule
-from db.models.audit import LoginLog, OperationLog
+from db.models.audit import DataQueryLog, KnowledgeAudit, LoginLog, OperationLog
 from db.models.biz_report import BizReport
 from db.models.chat import ChatMessage, ChatSession
 from db.models.furnace import Furnace, KilnProcessSample
@@ -44,6 +44,8 @@ __all__ = [
     "AlertRule",
     "LoginLog",
     "OperationLog",
+    "KnowledgeAudit",
+    "DataQueryLog",
     "BizReport",
     "Workflow",
     "WorkflowVersion",

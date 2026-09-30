@@ -3,18 +3,20 @@ from __future__ import annotations
 
 
 import re
+import time
 
 
 
 import httpx
 
-from fastapi import APIRouter, File, Form, Query, UploadFile
+from fastapi import APIRouter, File, Form, Query, Request, UploadFile
 
 from sqlalchemy import select
 
 
 
 from api.deps import CurrentUser, DbSession
+from api.services import audit as audit_svc
 from api.services.menus import user_is_admin
 
 from api.schemas.knowledge import (
@@ -78,6 +80,73 @@ def _html_to_text(raw: str) -> str:
     return text.strip()
 
 
+def _doc_brief(item: dict | None) -> dict | None:
+    if not item:
+        return None
+    return {
+        "id": item.get("id"),
+        "name": item.get("name"),
+        "source": item.get("source"),
+        "fileType": item.get("fileType"),
+        "size": item.get("size"),
+    }
+
+
+def _base_brief(item: dict | None) -> dict | None:
+    if not item:
+        return None
+    return {
+        "id": item.get("id"),
+        "name": item.get("name"),
+        "description": item.get("description"),
+        "purpose": item.get("purpose"),
+        "status": item.get("status"),
+    }
+
+
+def _acl_brief(data: dict | None) -> dict | None:
+    if not data:
+        return None
+    grants = data.get("grants") or []
+    return {
+        "baseId": data.get("baseId"),
+        "grants": [
+            {
+                "subjectType": g.get("subjectType"),
+                "subjectId": g.get("subjectId"),
+                "canView": g.get("canView"),
+                "canUse": g.get("canUse"),
+                "canManage": g.get("canManage"),
+            }
+            for g in grants
+            if isinstance(g, dict)
+        ],
+    }
+
+
+async def _kb_audit(
+    request: Request,
+    user,
+    *,
+    action: str,
+    base_id: str | None,
+    doc_id: str | None = None,
+    before: dict | None = None,
+    after: dict | None = None,
+) -> None:
+    await audit_svc.record_knowledge_change(
+        action=action,
+        base_id=base_id,
+        doc_id=doc_id,
+        operator_id=getattr(user, "id", None),
+        operator_username=getattr(user, "username", None),
+        before=before,
+        after=after,
+        ip=audit_svc.client_ip(request),
+        request_id=audit_svc.request_id_of(request),
+    )
+
+
 
 
 
@@ -102,7 +171,9 @@ async def bases_list(
 
 
 @router.post("/bases")
-async def bases_create(body: CreateBaseRequest, db: DbSession, user: CurrentUser) -> dict:
+async def bases_create(
+    body: CreateBaseRequest, request: Request, db: DbSession, user: CurrentUser
+) -> dict:
     if not user_is_admin(user):
         raise AppError(ErrorCode.FORBIDDEN, "仅管理员可创建知识库", status_code=403)
     item = await bases_svc.create_base(
@@ -111,6 +182,7 @@ async def bases_create(body: CreateBaseRequest, db: DbSession, user: CurrentUser
         description=body.description,
         created_by=user.id,
     )
+    await _kb_audit(request, user, action="create_base", base_id=item.get("id"), after=_base_brief(item))
     return ok({"item": kb_access.attach_perms(item, set(kb_access.ALL_PERMS))})
 
 
@@ -128,13 +200,26 @@ async def bases_acl_get(base_id: str, db: DbSession, user: CurrentUser) -> dict:
 
 @router.put("/bases/{base_id}/acl")
 async def bases_acl_put(
-    base_id: str, body: ReplaceAclRequest, db: DbSession, user: CurrentUser
+    base_id: str,
+    body: ReplaceAclRequest,
+    request: Request,
+    db: DbSession,
+    user: CurrentUser,
 ) -> dict:
+    before = await kb_access.list_acl(db, user, base_id)
     data = await kb_access.replace_acl(
         db,
         user,
         base_id,
         [g.model_dump() for g in body.grants],
+    )
+    await _kb_audit(
+        request,
+        user,
+        action="acl_update",
+        base_id=base_id,
+        before=_acl_brief(before),
+        after=_acl_brief(data),
     )
     return ok(data)
 
@@ -143,10 +228,13 @@ async def bases_acl_put(
 async def bases_update(
     base_id: str,
     body: UpdateBaseRequest,
+    request: Request,
     db: DbSession,
     user: CurrentUser,
 ) -> dict:
     await kb_access.require_base(db, user, base_id, kb_access.PERM_MANAGE)
+    before_base = await bases_svc.get_base_by_public_id(db, base_id)
+    before = _base_brief(bases_svc.to_base_item(before_base))
     item = await bases_svc.update_base(
         db,
         public_id=base_id,
@@ -155,11 +243,16 @@ async def bases_update(
     )
     base = await bases_svc.get_base_by_public_id(db, base_id)
     flags = await kb_access.perms_for_base(db, user, base)
+    await _kb_audit(
+        request, user, action="update_base", base_id=base_id, before=before, after=_base_brief(item)
+    )
     return ok({"item": kb_access.attach_perms(item, flags)})
 
 
 @router.delete("/bases/{base_id}")
-async def bases_delete(base_id: str, db: DbSession, user: CurrentUser) -> dict:
+async def bases_delete(
+    base_id: str, request: Request, db: DbSession, user: CurrentUser
+) -> dict:
     await kb_access.require_base(db, user, base_id, kb_access.PERM_MANAGE)
 
     result = await bases_svc.delete_base(db, public_id=base_id)
@@ -178,6 +271,14 @@ async def bases_delete(base_id: str, db: DbSession, user: CurrentUser) -> dict:
 
             store.delete_by_doc_id(doc_id)
 
+    await _kb_audit(
+        request,
+        user,
+        action="delete_base",
+        base_id=base_id,
+        before=_base_brief(result.get("base") if isinstance(result.get("base"), dict) else None),
+        after={"deletedDocIds": result.get("deletedDocIds") or []},
+    )
     return ok(result)
 
 
@@ -218,6 +319,8 @@ async def documents_upload(
 
     body: UploadDocumentRequest,
 
+    request: Request,
+
     db: DbSession,
 
     user: CurrentUser,
@@ -250,6 +353,15 @@ async def documents_upload(
 
     )
 
+    await _kb_audit(
+        request,
+        user,
+        action="upload_doc",
+        base_id=body.baseId,
+        doc_id=str(item.get("id") or "") or None,
+        after=_doc_brief(item),
+    )
+
     items = await list_documents(db, base_public_id=body.baseId)
 
     return {
@@ -275,6 +387,8 @@ async def documents_upload(
 async def documents_from_text(
 
     body: TextDocumentRequest,
+
+    request: Request,
 
     db: DbSession,
 
@@ -306,6 +420,15 @@ async def documents_from_text(
 
     )
 
+    await _kb_audit(
+        request,
+        user,
+        action="upload_doc",
+        base_id=body.baseId,
+        doc_id=str(item.get("id") or "") or None,
+        after=_doc_brief(item),
+    )
+
     items = await list_documents(db, base_public_id=body.baseId)
 
     return {
@@ -331,6 +454,8 @@ async def documents_from_text(
 async def documents_from_url(
 
     body: UrlDocumentRequest,
+
+    request: Request,
 
     db: DbSession,
 
@@ -392,6 +517,15 @@ async def documents_from_url(
 
     )
 
+    await _kb_audit(
+        request,
+        user,
+        action="upload_doc",
+        base_id=body.baseId,
+        doc_id=str(item.get("id") or "") or None,
+        after=_doc_brief(item),
+    )
+
     items = await list_documents(db, base_public_id=body.baseId)
 
     return {
@@ -413,20 +547,44 @@ async def documents_from_url(
 
 
 @router.post("/search")
-async def knowledge_search(body: SearchRequest, db: DbSession, user: CurrentUser) -> dict:
+async def knowledge_search(
+    body: SearchRequest, request: Request, db: DbSession, user: CurrentUser
+) -> dict:
+    started = time.perf_counter()
     if body.baseId:
         await kb_access.require_base(db, user, body.baseId, kb_access.PERM_USE)
         kb_ids = [body.baseId]
     else:
         kb_ids = await kb_access.usable_public_ids(db, user)
-        if not kb_ids:
-            return {"code": 0, "msg": "ok", "data": {"chunks": []}, "chunks": []}
-    chunks = await search_chunks(
-        db,
-        query=body.query,
-        top_k=body.topK,
-        min_score=body.minScore,
-        kb_ids=kb_ids,
+    chunks: list = []
+    success = True
+    summary = "chunks=0"
+    try:
+        if kb_ids:
+            chunks = await search_chunks(
+                db,
+                query=body.query,
+                top_k=body.topK,
+                min_score=body.minScore,
+                kb_ids=kb_ids,
+            )
+        summary = f"chunks={len(chunks)}"
+    except Exception:
+        success = False
+        summary = "search failed"
+        raise
+    finally:
+        await audit_svc.record_data_query(
+            source="knowledge",
+            query_text=body.query,
+            success=success,
+            duration_ms=int((time.perf_counter() - started) * 1000),
+            params={"baseId": body.baseId, "topK": body.topK, "kbCount": len(kb_ids)},
+            result_summary=summary,
+            operator_id=user.id,
+            operator_username=user.username,
+        ip=audit_svc.client_ip(request),
+        request_id=audit_svc.request_id_of(request),
     )
     return {"code": 0, "msg": "ok", "data": {"chunks": chunks}, "chunks": chunks}
 
@@ -471,6 +629,7 @@ async def documents_download(
 
 @router.post("/documents/upload-video")
 async def documents_upload_video(
+    request: Request,
     db: DbSession,
     user: CurrentUser,
     file: UploadFile = File(..., description="视频原片：mp4 / webm"),
@@ -489,6 +648,14 @@ async def documents_upload_video(
         uploader=user.display_name or user.username,
         created_by=user.id,
     )
+    await _kb_audit(
+        request,
+        user,
+        action="upload_doc",
+        base_id=baseId,
+        doc_id=str(item.get("id") or "") or None,
+        after=_doc_brief(item),
+    )
     items = await list_documents(db, base_public_id=baseId)
     return {
         "code": 0,
@@ -501,6 +668,7 @@ async def documents_upload_video(
 
 @router.post("/documents/upload-image")
 async def documents_upload_image(
+    request: Request,
     db: DbSession,
     user: CurrentUser,
     file: UploadFile = File(..., description="图片原件：png / jpg / jpeg / webp / gif / bmp"),
@@ -518,6 +686,14 @@ async def documents_upload_image(
         tags=tag_list,
         uploader=user.display_name or user.username,
         created_by=user.id,
+    )
+    await _kb_audit(
+        request,
+        user,
+        action="upload_doc",
+        base_id=baseId,
+        doc_id=str(item.get("id") or "") or None,
+        after=_doc_brief(item),
     )
     items = await list_documents(db, base_public_id=baseId)
     return {
@@ -558,6 +734,8 @@ async def documents_file(
 async def documents_delete(
 
     public_id: str,
+
+    request: Request,
 
     db: DbSession,
 
@@ -601,6 +779,15 @@ async def documents_delete(
     await db.delete(doc)
 
     await db.commit()
+
+    await _kb_audit(
+        request,
+        user,
+        action="delete_doc",
+        base_id=baseId,
+        doc_id=public_id,
+        before=_doc_brief(deleted),
+    )
 
     items = await list_documents(db, base_public_id=baseId)
 

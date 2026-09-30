@@ -5,7 +5,7 @@ from fastapi.middleware.cors import CORSMiddleware
 from fastapi.responses import JSONResponse
 import logging
 
-from api.middleware import JwtAuthMiddleware, OperationLogMiddleware
+from api.middleware import JwtAuthMiddleware, OperationLogMiddleware, RequestIdMiddleware
 from api.routers import (
     agents,
     ai,
@@ -42,9 +42,13 @@ async def _lifespan(_app: FastAPI):
 
         deleted = await audit_svc.purge_expired_logs()
         logging.getLogger("api.app").info(
-            "audit purge on startup operations=%s logins=%s",
+            "audit purge on startup operations=%s logins=%s knowledge=%s queries=%s hotConfigs=%s chats=%s",
             deleted.get("operations", 0),
             deleted.get("logins", 0),
+            deleted.get("knowledge", 0),
+            deleted.get("queries", 0),
+            deleted.get("hotConfigs", 0),
+            deleted.get("chats", 0),
         )
     except Exception:  # noqa: BLE001
         logging.getLogger("api.app").exception("audit purge on startup failed")
@@ -81,9 +85,10 @@ def create_app() -> FastAPI:
         lifespan=_lifespan,
     )
 
-    # 先注册 JWT（内侧），再注册操作日志，最后 CORS（外侧），保证 401 响应也带 CORS 头
+    # 先注册 JWT（内侧），再注册操作日志，再 Request-Id，最后 CORS（外侧）
     app.add_middleware(JwtAuthMiddleware)
     app.add_middleware(OperationLogMiddleware)
+    app.add_middleware(RequestIdMiddleware)
     # CORS: default "*" allows any Origin. For production set CORS_ORIGINS to frontend URLs.
     # With allow_credentials=True, Starlette echoes the request Origin instead of literal "*".
     app.add_middleware(
@@ -92,6 +97,7 @@ def create_app() -> FastAPI:
         allow_credentials=True,
         allow_methods=["*"],
         allow_headers=["*"],
+        expose_headers=["X-Request-Id", "Content-Disposition"],
     )
 
     @app.exception_handler(AppError)

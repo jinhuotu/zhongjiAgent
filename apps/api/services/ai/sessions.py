@@ -1,6 +1,7 @@
 from __future__ import annotations
 
 import secrets
+from datetime import datetime, timezone
 from typing import Any
 
 from sqlalchemy import select
@@ -41,6 +42,7 @@ def to_session_item(
         "lastMessageAt": _ts_ms(session.last_message_at),
         "createdAt": _ts_ms(session.created_at),
         "updatedAt": _ts_ms(session.updated_at),
+        "deleted": session.deleted_at is not None,
     }
     if include_messages:
         if messages_override is not None:
@@ -64,7 +66,7 @@ def to_session_item(
 async def list_sessions(db: AsyncSession, *, user_id: int) -> list[dict[str, Any]]:
     result = await db.execute(
         select(ChatSession)
-        .where(ChatSession.user_id == user_id)
+        .where(ChatSession.user_id == user_id, ChatSession.deleted_at.is_(None))
         .order_by(ChatSession.updated_at.desc())
     )
     return [to_session_item(s) for s in result.scalars().all()]
@@ -102,6 +104,7 @@ async def get_session_for_user(
     stmt = select(ChatSession).where(
         ChatSession.public_id == public_id,
         ChatSession.user_id == user_id,
+        ChatSession.deleted_at.is_(None),
     )
     if with_messages:
         stmt = stmt.options(selectinload(ChatSession.messages))
@@ -137,9 +140,10 @@ async def update_session(
 
 
 async def delete_session(db: AsyncSession, *, public_id: str, user_id: int) -> None:
+    """对用户软删除：清掉热缓存，保留 MySQL 会话与消息供审计追溯。"""
     session = await get_session_for_user(db, public_id=public_id, user_id=user_id, with_messages=False)
     await memory_svc.delete_hot_session(public_id)
-    await db.delete(session)
+    session.deleted_at = datetime.now(timezone.utc)
     await db.commit()
 
 

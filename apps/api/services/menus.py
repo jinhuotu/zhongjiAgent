@@ -1,4 +1,7 @@
-"""菜单权限：按角色白名单返回可访问的导航 href。管理页只给管理员。"""
+"""菜单权限：按角色白名单返回可访问的导航 href。
+
+管理类页面（用户、模型、工作流等）仅管理员；审计日志 `/logs` 可授予 auditor 等只读角色。
+"""
 
 from __future__ import annotations
 
@@ -14,7 +17,7 @@ ADMIN_ONLY_MENUS = frozenset(
         "/mcp-manage",
         "/workflows",
         "/users",
-        "/logs",
+        # /logs 可由 auditor 等角色只读授权，不再强制仅管理员
     }
 )
 
@@ -131,6 +134,7 @@ SEED_ROLE_MENUS: dict[str, tuple[str, ...]] = {
         "/furnaces",
         "/knowledge",
         "/ai-chat",
+        "/logs",
     ),
     "energy_director": BUSINESS_MENUS,
     "carbon_manager": BUSINESS_MENUS,

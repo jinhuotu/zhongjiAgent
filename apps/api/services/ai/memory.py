@@ -338,7 +338,11 @@ async def load_session_with_messages_for_title(
     """标题生成：优先 Redis 热消息，否则 MySQL。"""
     result = await db.execute(
         select(ChatSession)
-        .where(ChatSession.public_id == public_id, ChatSession.user_id == user_id)
+        .where(
+            ChatSession.public_id == public_id,
+            ChatSession.user_id == user_id,
+            ChatSession.deleted_at.is_(None),
+        )
         .options(selectinload(ChatSession.messages))
     )
     session = result.scalar_one_or_none()

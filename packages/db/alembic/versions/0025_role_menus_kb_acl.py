@@ -43,6 +43,7 @@ _AUDITOR = [
     "/furnaces",
     "/knowledge",
     "/ai-chat",
+    "/logs",
 ]
 _BUSINESS = [
     "/",

@@ -18,6 +18,8 @@ from api.services.audit import (  # noqa: E402
     match_write_target,
     retention_cutoff,
     retention_days,
+    rows_to_csv,
+    trace_retention_days,
 )
 
 
@@ -69,6 +71,44 @@ def test_match_write_covers_required_modules() -> None:
     )
     assert match_write_target("POST", "/api/v1/models") == ("models", "create", None)
     assert match_write_target("DELETE", "/api/v1/models/m1") == ("models", "delete", "m1")
+    assert match_write_target("POST", "/api/v1/knowledge/bases") == (
+        "knowledge",
+        "create",
+        "bases",
+    )
+    assert match_write_target("DELETE", "/api/v1/knowledge/documents/doc1") == (
+        "knowledge",
+        "delete",
+        "documents/doc1",
+    )
+    assert match_write_target("POST", "/api/v1/agents") == ("agents", "create", None)
+    assert match_write_target("PUT", "/api/v1/workflows/w1") == ("workflows", "update", "w1")
+    assert match_write_target("PATCH", "/api/v1/prompts/p1") == ("prompts", "update", "p1")
+    assert match_write_target("DELETE", "/api/v1/governance/tasks/t1") == (
+        "governance",
+        "delete",
+        "tasks/t1",
+    )
+    assert match_write_target("DELETE", "/api/v1/ai/sessions/sess1") == (
+        "ai",
+        "delete_session",
+        "sess1",
+    )
+    assert match_write_target("POST", "/api/v1/workflows/w1/publish") == (
+        "workflows",
+        "publish",
+        "w1",
+    )
+    assert match_write_target("POST", "/api/v1/workflows/w1/runs") == (
+        "workflows",
+        "run",
+        "w1",
+    )
+    assert match_write_target("PUT", "/api/v1/workflows/w1/graph") == (
+        "workflows",
+        "update_graph",
+        "w1",
+    )
 
 
 def test_match_write_skips_reads_and_other_modules() -> None:
@@ -76,6 +116,7 @@ def test_match_write_skips_reads_and_other_modules() -> None:
     assert match_write_target("GET", "/api/v1/models/runtime") is None
     assert match_write_target("POST", "/api/v1/auth/login") is None
     assert match_write_target("POST", "/api/v1/ai/chat") is None
+    assert match_write_target("POST", "/api/v1/knowledge/search") is None
     assert match_write_target("DELETE", "/api/v1/audit/operations") is None
 
 
@@ -100,3 +141,16 @@ def test_retention_cutoff_is_seven_days() -> None:
     now = datetime(2026, 8, 14, 12, 0, tzinfo=timezone.utc)
     cutoff = retention_cutoff(now)
     assert (now - cutoff).days == 7
+
+
+def test_trace_retention_default_is_at_least_ops() -> None:
+    assert trace_retention_days() >= retention_days()
+    assert trace_retention_days() >= 180
+
+
+def test_rows_to_csv_escapes_and_has_bom() -> None:
+    raw = rows_to_csv(["a", "b"], [["1", 'say "hi"'], ["x,y", "z"]])
+    text = raw.decode("utf-8-sig")
+    assert text.startswith("a,b\n")
+    assert 'say ""hi""' in text
+    assert '"x,y"' in text

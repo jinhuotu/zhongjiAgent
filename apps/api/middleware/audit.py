@@ -1,4 +1,4 @@
-"""写入类请求的操作日志中间件（用户/角色/热配置/MCP/模型）。"""
+"""写入类请求的操作日志中间件（管理配置、知识库、工作流、智能体、提示词、治理任务、会话删除）。"""
 
 from __future__ import annotations
 
@@ -29,6 +29,7 @@ class OperationLogMiddleware(BaseHTTPMiddleware):
         ua = audit_svc.user_agent(request)
         method = request.method.upper()
         path = request.url.path
+        request_id = audit_svc.request_id_of(request)
 
         try:
             response = await call_next(request)
@@ -45,6 +46,7 @@ class OperationLogMiddleware(BaseHTTPMiddleware):
                 status_code=500,
                 error_msg="unhandled exception",
                 duration_ms=int((time.perf_counter() - started) * 1000),
+                request_id=request_id,
             )
             raise
 
@@ -66,6 +68,7 @@ class OperationLogMiddleware(BaseHTTPMiddleware):
             status_code=status_code,
             error_msg=error_msg,
             duration_ms=int((time.perf_counter() - started) * 1000),
+            request_id=request_id or audit_svc.request_id_of(request),
         )
         return response
 
@@ -83,8 +86,10 @@ async def _persist(
     status_code: int,
     error_msg: str | None,
     duration_ms: int,
+    request_id: str = "",
 ) -> None:
     operator = getattr(request.state, "jwt_sub", None)
+    operator_username = str(operator) if operator else None
     try:
         await audit_svc.record_operation(
             module=module,
@@ -92,13 +97,20 @@ async def _persist(
             method=method,
             path=path,
             resource_id=resource_id,
-            operator_username=str(operator) if operator else None,
+            operator_username=operator_username,
             success=status_code < 400,
             status_code=status_code,
             ip=ip,
             user_agent_str=ua,
             error_msg=error_msg,
             duration_ms=duration_ms,
+            request_id=request_id,
+            detail=audit_svc.build_operation_detail(
+                module=module,
+                action=action,
+                resource_id=resource_id,
+                status_code=status_code,
+            ),
         )
     except Exception:  # noqa: BLE001
         logger.exception("operation log persist failed path=%s", path)

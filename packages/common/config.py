@@ -54,8 +54,12 @@ class Settings(BaseSettings):
     chat_ttl_scan_threshold_seconds: int = 3600
     chat_ttl_scan_cron: str = "0 3 * * *"  # 每天 03:00
     hot_config_hash_key: str = "hot:config"
-    # 操作日志 / 登录日志滚动保留天数（超时删除，系统最多保留该窗口）
+    # 操作日志 / 登录日志滚动保留天数（运维窗口，默认 7 天）
     audit_log_retention_days: int = 7
+    # 知识库变更 / 数据查询 / 已软删问答的合规保留天数（默认 180 天 ≈ 6 个月）
+    audit_trace_retention_days: int = 180
+    # 单次审计导出最大行数
+    audit_export_max_rows: int = 5000
 
     jwt_secret_key: str = "change-me-in-production-use-long-random-string"
     jwt_algorithm: str = "HS256"

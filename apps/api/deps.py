@@ -52,11 +52,25 @@ async def require_admin(user: Annotated[User, Depends(get_current_user)]) -> Use
     return user
 
 
+async def require_audit_reader(user: Annotated[User, Depends(get_current_user)]) -> User:
+    """管理员或被授予「审计日志」菜单的角色（如 auditor）可只读访问。"""
+    from api.services.menus import can_access_menu
+
+    if user_is_admin(user) or can_access_menu(user, "/logs"):
+        return user
+    raise AppError(ErrorCode.FORBIDDEN, "audit reader only", status_code=403)
+
+
 CurrentUser = Annotated[User, Depends(get_current_user)]
 AdminUser = Annotated[User, Depends(require_admin)]
+AuditReader = Annotated[User, Depends(require_audit_reader)]
 
 
 async def get_request_id(
+    request: Request,
     x_request_id: Annotated[str | None, Header(alias="X-Request-Id")] = None,
 ) -> str:
-    return x_request_id or ""
+    rid = (x_request_id or "").strip()
+    if rid:
+        return rid[:64]
+    return str(getattr(request.state, "request_id", "") or "")[:64]

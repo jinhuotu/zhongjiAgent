@@ -55,6 +55,12 @@ class ChatSession(Base):
         nullable=False,
         comment="更新时间",
     )
+    deleted_at: Mapped[datetime | None] = mapped_column(
+        DateTime(timezone=True),
+        nullable=True,
+        index=True,
+        comment="用户删除时间；非空则对用户隐藏，审计仍可查",
+    )
 
     messages: Mapped[list[ChatMessage]] = relationship(
         "ChatMessage",

@@ -9,6 +9,7 @@ from pydantic import BaseModel, Field
 from sse_starlette.sse import EventSourceResponse
 
 from api.deps import CurrentUser, DbSession
+from api.services import audit as audit_svc
 from api.services.ai import memory as memory_svc
 from api.services.ai import sessions as sessions_svc
 from api.services.ai.long_memory import recall_long_memory
@@ -400,6 +401,8 @@ async def ai_chat(
                             chunks=chunks,
                             tools_enabled=tools_enabled,
                             allowed_tool_ids=allowed_tool_ids,
+                            operator_username=user.username,
+                            request_id=audit_svc.request_id_of(request),
                         ):
                             if await request.is_disconnected():
                                 logger.info(

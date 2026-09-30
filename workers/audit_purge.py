@@ -12,10 +12,16 @@ async def purge_expired_audit_logs() -> dict[str, int]:
     try:
         result = await audit_svc.purge_expired_logs()
         logger.info(
-            "audit log purge deleted operations=%s logins=%s retention_days=%s",
+            "audit log purge deleted operations=%s logins=%s knowledge=%s queries=%s hotConfigs=%s chats=%s "
+            "ops_days=%s trace_days=%s",
             result.get("operations", 0),
             result.get("logins", 0),
+            result.get("knowledge", 0),
+            result.get("queries", 0),
+            result.get("hotConfigs", 0),
+            result.get("chats", 0),
             audit_svc.retention_days(),
+            audit_svc.trace_retention_days(),
         )
         return result
     except Exception:  # noqa: BLE001

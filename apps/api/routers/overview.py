@@ -9,6 +9,7 @@ from common.response import ok
 router = APIRouter(prefix="/overview", tags=["overview"])
 
 
+# 薄层路由：只收 kilnCode 参数+包 ok() 信封，重活在 services/overview.get_overview()
 @router.get("")
 async def overview_get(
     db: DbSession,

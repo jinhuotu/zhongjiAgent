@@ -20,9 +20,11 @@ class PageData(BaseModel, Generic[T]):
     page_size: int = 20
 
 
+# 成功信封：所有接口统一 {code:0,msg,data}，前端只认 code===0
 def ok(data: Any = None, msg: str = "ok") -> dict[str, Any]:
     return {"code": 0, "msg": msg, "data": data}
 
 
+# 失败信封：HTTP 状态与业务 code 分离，异常处理器调它
 def fail(code: int, msg: str, data: Any = None) -> dict[str, Any]:
     return {"code": code, "msg": msg, "data": data}

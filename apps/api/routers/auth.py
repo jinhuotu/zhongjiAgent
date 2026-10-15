@@ -19,6 +19,7 @@ from db.models.user import User
 router = APIRouter(prefix="/auth", tags=["auth"])
 
 
+# 组装用户信息：ORM roles 转 code 列表 + 菜单并集，供前端渲染侧边栏
 def _user_info(user: User) -> UserInfo:
     return UserInfo(
         id=user.id,
@@ -31,6 +32,7 @@ def _user_info(user: User) -> UserInfo:
     )
 
 
+# 登录：查库+bcrypt 验密，成功发 access+refresh，失败也记日志防爆破
 @router.post("/login")
 async def login(body: LoginRequest, request: Request, db: DbSession) -> dict:
     ip = audit_svc.client_ip(request)
@@ -75,6 +77,7 @@ async def login(body: LoginRequest, request: Request, db: DbSession) -> dict:
     return ok({**tokens.model_dump(), "user": _user_info(user).model_dump()})
 
 
+# 刷新：只验 refresh 签名和 type，不查库，直接换一对新 token
 @router.post("/refresh")
 async def refresh(body: RefreshRequest) -> dict:
     try:
@@ -93,6 +96,7 @@ async def refresh(body: RefreshRequest) -> dict:
     return ok(tokens.model_dump())
 
 
+# 我的信息：需登录，前端刷新页靠它恢复登录态
 @router.get("/me")
 async def me(user: CurrentUser) -> dict:
     return ok(_user_info(user).model_dump())

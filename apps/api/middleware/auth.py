@@ -13,6 +13,7 @@ from common.errors import ErrorCode
 from common.response import fail
 from common.security import decode_token
 
+# 白名单-精确匹配：健康检查/登录/刷新/docs 放行，无需 token
 # 精确匹配
 _EXACT_WHITELIST = frozenset(
     {
@@ -26,6 +27,7 @@ _EXACT_WHITELIST = frozenset(
     }
 )
 
+# 白名单-前缀匹配：Swagger 静态资源放行
 # 前缀匹配（Swagger 静态资源等）
 _PREFIX_WHITELIST = (
     "/docs/",
@@ -57,6 +59,7 @@ def access_token_from_headers(headers) -> str:
     return extra
 
 
+# 取 token 统一入口：先看请求头，再看知识库原件 ?access_token=（<video>/<img> 发不出头）
 def access_token_from_request(request: Request) -> str:
     token = access_token_from_headers(request.headers)
     if token:
@@ -66,6 +69,7 @@ def access_token_from_request(request: Request) -> str:
     return (request.query_params.get("access_token") or "").strip()
 
 
+# 纯 ASGI 网关：不用 BaseHTTPMiddleware，避免 SSE/视频 Range 流被缓冲卡死
 class JwtAuthMiddleware:
     def __init__(self, app: ASGIApp) -> None:
         self.app = app
@@ -80,6 +84,7 @@ class JwtAuthMiddleware:
             await self.app(scope, receive, send)
             return
 
+        # 校验三步：取 token -> 验签 -> 查 type/sub，失败回 401{code:40100}
         token = access_token_from_request(request)
         if not token:
             response = JSONResponse(
@@ -112,5 +117,6 @@ class JwtAuthMiddleware:
             )
             await response(scope, receive, send)
             return
+        # 验签通过：把用户名存 state，供 deps.get_current_user 复用，免二次验签
         request.state.jwt_sub = sub
         await self.app(scope, receive, send)

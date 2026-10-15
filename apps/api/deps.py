@@ -9,9 +9,11 @@ from common.security import decode_token
 from db.models.user import User
 from db.session import get_db
 
+# 每请求一个异步 DB 会话：前端每次 fetch 对应一次
 DbSession = Annotated[AsyncSession, Depends(get_db)]
 
 
+# 当前用户：先复用中间件的 jwt_sub，没有再从头/参数取 token 验签查库；禁用用户 401
 async def get_current_user(
     request: Request,
     db: DbSession,
@@ -46,6 +48,7 @@ def user_is_admin(user: User) -> bool:
     return any(getattr(r, "code", None) == "admin" for r in (user.roles or []))
 
 
+# 管理员门禁：is_superuser 或有 admin 角色才过，否则 403
 async def require_admin(user: Annotated[User, Depends(get_current_user)]) -> User:
     if not user_is_admin(user):
         raise AppError(ErrorCode.FORBIDDEN, "admin only", status_code=403)
@@ -61,6 +64,7 @@ async def require_audit_reader(user: Annotated[User, Depends(get_current_user)])
     raise AppError(ErrorCode.FORBIDDEN, "audit reader only", status_code=403)
 
 
+# 快捷别名：路由参数写 user: CurrentUser / AdminUser / AuditReader 即可鉴权
 CurrentUser = Annotated[User, Depends(get_current_user)]
 AdminUser = Annotated[User, Depends(require_admin)]
 AuditReader = Annotated[User, Depends(require_audit_reader)]

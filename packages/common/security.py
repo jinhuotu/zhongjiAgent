@@ -7,6 +7,7 @@ from jose import JWTError, jwt
 from common.config import Settings, get_settings
 
 
+# 密码哈希：bcrypt 自带盐，注册/改密时用
 def hash_password(password: str) -> str:
     return bcrypt.hashpw(password.encode("utf-8"), bcrypt.gensalt()).decode("utf-8")
 
@@ -22,6 +23,7 @@ def _utcnow() -> datetime:
     return datetime.now(UTC)
 
 
+# 短期 token：默认 30 分钟，每次调业务接口都要带它
 def create_access_token(
     subject: str,
     *,
@@ -36,6 +38,7 @@ def create_access_token(
     return jwt.encode(payload, settings.jwt_secret_key, algorithm=settings.jwt_algorithm)
 
 
+# 长期 token：默认 7 天，只用来换新 access，不查库
 def create_refresh_token(
     subject: str,
     *,
@@ -47,6 +50,7 @@ def create_refresh_token(
     return jwt.encode(payload, settings.jwt_secret_key, algorithm=settings.jwt_algorithm)
 
 
+# 验签+过期检查：失败抛 ValueError，上层转 401
 def decode_token(token: str, *, settings: Settings | None = None) -> dict[str, Any]:
     settings = settings or get_settings()
     try:

@@ -80,6 +80,7 @@ def _hour_avg_gas(rows: list[KilnProcessSample]) -> float:
     return sum(nums) / len(nums)
 
 
+# 规则告警：按阈值拼高温/高耗/波动告警，前端首页告警卡片用
 def _build_alerts(
     kiln_code: str,
     kiln_name: str,
@@ -156,6 +157,7 @@ def _build_alerts(
     return alerts[:5]
 
 
+# 聚合入口：取末日往前 45 天内燃气最多的生产日为基准，算标煤/碳排/趋势/结构；无数据回空壳防前端崩
 async def get_overview(
     db: AsyncSession,
     *,

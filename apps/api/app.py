@@ -35,6 +35,7 @@ from common.logging import setup_logging
 from common.response import fail
 
 
+# 应用存活期：启动时清过期审计日志、起知识库视频/图片后台解析线程；异常只记日志不阻断启动
 @asynccontextmanager
 async def _lifespan(_app: FastAPI):
     try:
@@ -71,6 +72,7 @@ async def _lifespan(_app: FastAPI):
     yield
 
 
+# 组装入口：建 FastAPI 对象、挂中间件/路由/异常处理器，给 uvicorn 用
 def create_app() -> FastAPI:
     settings = get_settings()
     setup_logging("DEBUG" if settings.debug else "INFO")
@@ -86,6 +88,7 @@ def create_app() -> FastAPI:
     )
 
     # 先注册 JWT（内侧），再注册操作日志，再 Request-Id，最后 CORS（外侧）
+    # 中间件顺序：先加的在内侧；请求从外往里走 CORS -> RequestId -> 操作日志 -> JWT
     app.add_middleware(JwtAuthMiddleware)
     app.add_middleware(OperationLogMiddleware)
     app.add_middleware(RequestIdMiddleware)
@@ -100,6 +103,7 @@ def create_app() -> FastAPI:
         expose_headers=["X-Request-Id", "Content-Disposition"],
     )
 
+    # 统一异常：业务 AppError 转 {code,msg,data} 信封，HTTP 状态与业务 code 分离
     @app.exception_handler(AppError)
     async def app_error_handler(_: Request, exc: AppError) -> JSONResponse:
         # 5xx 业务错误也落日志，避免「只有浏览器 502、后端像没反应」
@@ -119,7 +123,7 @@ def create_app() -> FastAPI:
     # 公开健康检查（根路径 + 版本前缀）
     app.include_router(health.router)
     app.include_router(health.router, prefix=settings.api_prefix)
-    # 业务接口统一 /api/v1
+    # 业务接口统一挂 /api/v1，前端 VITE_API_BASE_URL 必须指向这里
     app.include_router(auth.router, prefix=settings.api_prefix)
     app.include_router(users.router, prefix=settings.api_prefix)
     app.include_router(roles.router, prefix=settings.api_prefix)

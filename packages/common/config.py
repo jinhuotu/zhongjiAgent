@@ -17,6 +17,7 @@ class Settings(BaseSettings):
     # "*" = allow any Origin (dev default). Production: set explicit frontend URLs.
     cors_origins: str = "*"
 
+    # 服务端口：前端 VITE_API_BASE_URL 要指向 api_port(8800)，否则 404
     api_host: str = "0.0.0.0"
     api_port: int = 8800
     ai_host: str = "0.0.0.0"
@@ -61,6 +62,7 @@ class Settings(BaseSettings):
     # 单次审计导出最大行数
     audit_export_max_rows: int = 5000
 
+    # 登录有效期：access 短(30 分钟)调接口用，refresh 长(7 天)只用来换新 token
     jwt_secret_key: str = "change-me-in-production-use-long-random-string"
     jwt_algorithm: str = "HS256"
     jwt_access_token_expire_minutes: int = 30
@@ -73,6 +75,7 @@ class Settings(BaseSettings):
     zhongji_root: str = ""
 
     # ---- LLM (AI 智能问答 / 报告) OpenAI-compatible ----
+    # 大模型网关：不配也能启动，只是 AI 对话会报未配置
     llm_api_base: str = ""
     llm_api_key: str = ""
     llm_model: str = "gpt-4o-mini"

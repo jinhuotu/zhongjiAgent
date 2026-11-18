@@ -133,3 +133,51 @@ class KilnProcessSample(Base):
         nullable=False,
         comment="更新时间",
     )
+
+
+class KilnCycle(Base):
+    """一次上传的窑次。曲线版本和装载由页面补齐，再次上传不覆盖这两项。"""
+
+    __tablename__ = "kiln_cycles"
+    __table_args__ = (
+        UniqueConstraint(
+            "kiln_code",
+            "source_file",
+            "batch_no",
+            name="uq_kiln_cycles_identity",
+        ),
+        {"comment": "窑次文件与匹配参数"},
+    )
+
+    id: Mapped[int] = mapped_column(
+        BigInteger, primary_key=True, autoincrement=True, comment="主键"
+    )
+    kiln_code: Mapped[str] = mapped_column(
+        String(32), nullable=False, index=True, comment="窑炉编码"
+    )
+    batch_no: Mapped[str] = mapped_column(String(16), nullable=False, default="", comment="窑次号")
+    source_file: Mapped[str] = mapped_column(String(255), nullable=False, comment="来源文件名")
+    start_ts: Mapped[datetime | None] = mapped_column(
+        DateTime(timezone=False), nullable=True, comment="窑次开始"
+    )
+    end_ts: Mapped[datetime | None] = mapped_column(
+        DateTime(timezone=False), nullable=True, comment="窑次结束"
+    )
+    sample_count: Mapped[int] = mapped_column(
+        Integer, nullable=False, default=0, comment="工况行数"
+    )
+    curve_version: Mapped[str | None] = mapped_column(String(64), nullable=True, comment="曲线版本")
+    load_kg: Mapped[float | None] = mapped_column(Float, nullable=True, comment="装载量 kg")
+    created_at: Mapped[datetime] = mapped_column(
+        DateTime(timezone=True),
+        server_default=func.now(),
+        nullable=False,
+        comment="创建时间",
+    )
+    updated_at: Mapped[datetime] = mapped_column(
+        DateTime(timezone=True),
+        server_default=func.now(),
+        onupdate=func.now(),
+        nullable=False,
+        comment="更新时间",
+    )

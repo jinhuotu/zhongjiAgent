@@ -14,6 +14,14 @@ build/
 .venv/
 venv/
 ENV/
+.glass_m0_venv/
+
+# Glass defect model binaries (大文件不进仓库)
+apps/model_server/models/glass/**/*.onnx
+apps/model_server/models/glass/**/*.pt
+scripts/glass_m0/out/
+scripts/glass_m0/out_strict/
+scripts/glass_m0/*.onnx
 
 # Poetry
 poetry.toml
@@ -44,6 +52,9 @@ storage/
 # Logs
 *.log
 logs/
+
+# Local verification runs and detection plots
+runs/
 
 # Alembic
 # keep versions; ignore local db dumps

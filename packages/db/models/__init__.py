@@ -4,9 +4,12 @@ from db.models.alert import AlertRule
 from db.models.audit import DataQueryLog, KnowledgeAudit, LoginLog, OperationLog
 from db.models.biz_report import BizReport
 from db.models.chat import ChatMessage, ChatSession
-from db.models.furnace import Furnace, KilnProcessSample
+from db.models.furnace import Furnace, KilnCycle, KilnProcessSample
+from db.models.glass import GlassDefectBox, GlassInspectionTask
 from db.models.governance import GovTask
 from db.models.hot_config import HotConfig, HotConfigAudit
+from db.models.kiln_analysis import KilnAnalysisRun
+from db.models.kiln_studio import KilnStudioAsset
 from db.models.knowledge import KnowledgeBase, KnowledgeBaseAcl, KnowledgeDocument
 from db.models.mcp import McpServer, McpTool
 from db.models.model_config import ModelConfig
@@ -29,7 +32,12 @@ __all__ = [
     "HotConfig",
     "HotConfigAudit",
     "Furnace",
+    "KilnCycle",
+    "KilnAnalysisRun",
+    "KilnStudioAsset",
     "KilnProcessSample",
+    "GlassInspectionTask",
+    "GlassDefectBox",
     "AiReport",
     "ProdSystem",
     "ProdTag",

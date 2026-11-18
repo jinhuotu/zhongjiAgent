@@ -17,6 +17,8 @@ from api.routers import (
     governance,
     health,
     hot_configs,
+    kiln_cycles,
+    kiln_studio,
     knowledge,
     mcp_servers,
     models,
@@ -69,6 +71,12 @@ async def _lifespan(_app: FastAPI):
         logging.getLogger("api.app").info("kb image worker started requeued=%s", n)
     except Exception:  # noqa: BLE001
         logging.getLogger("api.app").exception("kb image worker start failed")
+    try:
+        from api.services.kiln_studio import mark_interrupted
+
+        await mark_interrupted()
+    except Exception:
+        logging.getLogger("api.app").exception("kiln studio job recovery failed; check migration 0032")
     yield
 
 
@@ -136,6 +144,8 @@ def create_app() -> FastAPI:
     app.include_router(agents.router, prefix=settings.api_prefix)
     app.include_router(hot_configs.router, prefix=settings.api_prefix)
     app.include_router(furnaces.router, prefix=settings.api_prefix)
+    app.include_router(kiln_cycles.router, prefix=settings.api_prefix)
+    app.include_router(kiln_studio.router, prefix=settings.api_prefix)
     app.include_router(overview.router, prefix=settings.api_prefix)
     app.include_router(production.router, prefix=settings.api_prefix)
     app.include_router(governance.router, prefix=settings.api_prefix)

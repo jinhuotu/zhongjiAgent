@@ -1,0 +1,29 @@
+{
+  "version": "v1",
+  "format": "onnx",
+  "imgsz": 1280,
+  "opset": 12,
+  "dynamic": true,
+  "nms_embedded": false,
+  "letterbox": "stride",
+  "stride": 32,
+  "num_classes": 7,
+  "classes": [
+    "crack",
+    "spot",
+    "scratch",
+    "broken",
+    "broken_membrane",
+    "light_leakage",
+    "blot"
+  ],
+  "source_pt": "E:\\downLoad\\best.pt",
+  "source_note": "SSGD dataset, yolov8s baseline (train_ssgd.py)",
+  "onnx_size_bytes": 45037073,
+  "onnx_size_mb": 42.95,
+  "train_metrics": {
+    "mAP50": 0.491,
+    "mAP50_95": 0.221
+  },
+  "exported_at": "2026-10-19T11:41:12"
+}

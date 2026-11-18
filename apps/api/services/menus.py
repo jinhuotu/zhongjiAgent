@@ -43,6 +43,7 @@ ALL_MENUS: tuple[str, ...] = (
     "/production/batching",
     "/production/shuttle",
     "/furnaces",
+    "/kiln-cycles",
     "/devices",
     "/energy",
     "/energy-flow",
@@ -114,6 +115,7 @@ SEED_ROLE_MENUS: dict[str, tuple[str, ...]] = {
         "/",
         "/realtime",
         "/furnaces",
+        "/kiln-cycles",
         "/production/tunnel",
         "/production/batching",
         "/production/shuttle",
@@ -132,6 +134,7 @@ SEED_ROLE_MENUS: dict[str, tuple[str, ...]] = {
         "/product-footprint",
         "/energy",
         "/furnaces",
+        "/kiln-cycles",
         "/knowledge",
         "/ai-chat",
         "/logs",
@@ -208,7 +211,10 @@ def resolve_menus(user: User) -> list[str]:
     allowed -= ADMIN_ONLY_MENUS
     if not allowed:
         return ["/"]
-    return expand_menu_families(_sort_menus(allowed))
+    menus = expand_menu_families(_sort_menus(allowed))
+    if "/furnaces" in menus or "/energy" in menus:
+        menus = _sort_menus([*menus, "/kiln-cycles"])
+    return menus
 
 
 def can_access_menu(user: User, href: str) -> bool:

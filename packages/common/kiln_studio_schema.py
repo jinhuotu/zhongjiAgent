@@ -96,6 +96,7 @@ class AlgorithmMetadata(Strict):
     dataRequirements: list[str]
     interpretability: Literal["high", "medium", "low"]
     sampleSizeRisk: Literal["high", "medium", "low"]
+    inferenceComplexity: Literal["high", "medium", "low"] | None = None
     interventionCapable: bool
     status: Literal["enabled", "experimental", "disabled"]
     version: str
@@ -176,6 +177,24 @@ class CatalogRevisionRequest(Strict):
         if not self.name:
             raise ValueError("机理名称不能为空")
         return self
+
+
+class DocumentRecognitionRequest(Strict):
+    fileIds: list[Annotated[str, Field(min_length=1, max_length=40)]] = Field(
+        default_factory=list, max_length=200
+    )
+    mode: Literal["rules", "ai"] = "rules"
+
+
+class DocumentMechanismCandidate(CatalogRevisionRequest):
+    templateKey: TemplateKey | None = None
+    sourceIds: list[Annotated[str, Field(min_length=1, max_length=40)]] = Field(
+        min_length=1, max_length=8
+    )
+
+
+class DocumentMechanismExtraction(Strict):
+    mechanisms: list[DocumentMechanismCandidate] = Field(max_length=24)
 
 
 class SaveMechanismRequest(Strict):

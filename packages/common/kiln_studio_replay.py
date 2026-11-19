@@ -10,7 +10,9 @@ from common.kiln_studio_engine import make_features, physics, predict_model, tar
 from common.kiln_studio_forecast import _advance, _advance_scenario
 from common.kiln_studio_lstm import predict_lstm_path
 from common.kiln_studio_observations import clean_rows as _clean_rows
+from common.kiln_studio_observations import observed
 from common.kiln_studio_schema import ExperimentRequest, ReplayFrame, ReplayPackage, ReplayRequest
+from common.kiln_studio_temperature_path import predict_temperature_head
 
 _SIGNALS = ("temp", "temp_sp", "gas", "air", "afr", "o2", "pressure")
 _HELD_SIGNALS = ("temp", "gas", "air", "o2", "pressure")
@@ -140,6 +142,10 @@ def temperature_trajectory_method(artifact, config):
         return "persistence"
     if config.horizonMinutes == 1:
         return "minuteRecursive"
+    if set(range(1, config.horizonMinutes)).issubset(
+        int(step) for step in artifact.get("temperatureHeads", {})
+    ):
+        return "multiOutput"
     if key == "lstm" and set(range(1, config.horizonMinutes + 1)).issubset(
         artifact["model"].get("offsets") or ()
     ):
@@ -165,12 +171,41 @@ def _recursive_points(history, held, artifact, config, key, length, times, plans
         available = min(length, int(end - start + _EPSILON))
         value = predict_model(artifact, {"y0": origin[key]})
         return _series(length, dict.fromkeys(range(1, available + 1), value)), None
+    if artifact.get("temperatureHeads"):
+        values, virtual = {}, list(history)
+        date = datetime.fromisoformat(origin["ts"])
+        for segment in range(0, length, config.horizonMinutes):
+            segment_values = {}
+            for step in range(1, min(config.horizonMinutes, length - segment) + 1):
+                minute = start + segment + step
+                if _continuous_end(times, start + segment, minute, max_gap) < minute - _EPSILON:
+                    break
+                plan = _plan_at(times, plans, minute, max_gap)
+                step_config = config.model_copy(update={"horizonMinutes": step})
+                features = make_features(virtual, plan, step_config)
+                if features is None:
+                    break
+                value = predict_temperature_head(artifact, features, step)
+                if value is None or not isfinite(value):
+                    break
+                values[segment + step] = value
+                segment_values[step] = (value, plan)
+            if config.horizonMinutes not in segment_values:
+                break
+            # Every head in a segment shares its origin history, never future observations.
+            virtual.extend({
+                **held, key: value, "time": start + segment + step,
+                "ts": (date + timedelta(minutes=segment + step)).isoformat(),
+                "cycle": origin["cycle"], "temp_sp": plan,
+            } for step, (value, plan) in segment_values.items())
+        return _series(length, values), None
     date = datetime.fromisoformat(origin["ts"])
     native_step = config.horizonMinutes
-    fusion = config.task == "temperature" and artifact["algorithm"] == "fusion"
+    implementation = artifact.get("implementationKey", artifact["algorithm"])
+    fusion = config.task == "temperature" and implementation == "fusion"
     predictions, reference = {}, {}
     virtual = list(history)
-    lstm = artifact["algorithm"] == "lstm"
+    lstm = implementation == "lstm"
     for segment_start in range(0, length, native_step):
         offset = segment_start + native_step
         if offset > length and not lstm:
@@ -327,7 +362,8 @@ def build_replay_package(
     if any(gap <= 0 or not isfinite(gap) for gap in gaps):
         raise ValueError("窑次时间戳必须有效且严格递增")
     max_gap = median(gaps) * 1.5 + _EPSILON
-    plans = [row["temp_sp"] for row in rows]
+    # 设定取自归档计划列。未来实测（包括整行温度置零）不能改变计划输入。
+    plans = [observed(point.get("temp_sp")) for point in cycle["points"]]
     limit = request.horizonMinutes
     indices = _frame_indices(times, request.frameStepMinutes, origin_after)
     excluded_first = excluded_stop = len(rows)
@@ -349,7 +385,13 @@ def build_replay_package(
     stops = [bisect_right(times, times[index] + limit + _EPSILON) for index in indices]
     series_count = (
         len(selected)
-        + (config.task == "temperature" and "fusion" in request.selectedAlgorithms)
+        + (
+            config.task == "temperature"
+            and any(
+                artifact.get("implementationKey", artifact["algorithm"]) == "fusion"
+                for artifact, _ in selected
+            )
+        )
         + (request.includeMechanism and mechanism_parameters is not None)
     )
     actual_count = sum(stop - index - 1 for index, stop in zip(indices, stops, strict=True))
@@ -383,7 +425,7 @@ def build_replay_package(
             name = artifact["algorithm"]
             if origin[key] is None:
                 trajectories[name] = _series(limit, {})
-            elif name == "physics" and config.task == "temperature":
+            elif temperature_trajectory_method(artifact, model_config) == "mechanism":
                 trajectories[name] = _series(
                     limit,
                     _mechanism_points(
@@ -472,7 +514,7 @@ def build_replay_package(
                     "minute": row["time"] - times[0],
                     "ts": row["ts"],
                     "actual": None if excluded_first <= index < excluded_stop else row[key],
-                    "setpoint": None if excluded_first <= index < excluded_stop else row["temp_sp"],
+                    "setpoint": None if excluded_first <= index < excluded_stop else plans[index],
                 }
                 for index, row in enumerate(rows)
             ],

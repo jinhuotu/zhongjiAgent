@@ -18,7 +18,10 @@ from common.kiln_xls import (
     _guess_mapping,
     _load_xls,
     _load_xlsx,
+    _parse_pressure,
+    _parse_temp,
     _parse_time,
+    _to_float,
     _zip_name,
     parse_upload,
 )
@@ -28,6 +31,15 @@ MAX_TOTAL = 300_000_000
 MAX_ROWS = 100_000
 MAX_ARCHIVE_ENTRIES = 200
 MAX_ARCHIVE_DEPTH = 3
+AUX_EQUIPMENT = {
+    "后燃室七区温度": "post7",
+    "后燃室八区温度": "post8",
+    "换热器温度": "exchanger",
+    "排烟风温度": "exhaust",
+    "助燃风温度": "air_inlet",
+    "窑顶前温度": "roof_front",
+    "窑顶后温度": "roof_rear",
+}
 FIELD_NAMES = {
     "ts": ("时间", "timestamp", "time", "日期时间"),
     "temp_sp": ("设定温度", "temp_sp", "温度设定"),
@@ -37,11 +49,28 @@ FIELD_NAMES = {
     "air": ("助燃风流量", "air", "air_flow_instant", "助燃风瞬时流量"),
     "o2": ("氧含量", "o2", "o2_meas", "氧含量实测"),
     "pressure": ("窑压", "pressure", "furnace_p_meas", "窑压实测"),
+    "furnace_p_sp": ("窑压设定 (Pa)",),
+    "furnace_p_out": ("窑压输出 (%)",),
+    "gas_p_sp": ("燃气压力设定 (kPa)",),
+    "gas_p_meas": ("燃气压力实测 (kPa)",),
+    "gas_p_out": ("燃气压力输出 (%)",),
+    "air_p_sp": ("助燃风压力设定 (kPa)",),
+    "air_p_meas": ("助燃风压力实测 (kPa)",),
+    "air_p_out": ("助燃风压力输出 (%)",),
+    "air_total": ("助燃风累计量", "air_flow_total"),
+    "o2_sp": ("氧含量设定",),
+    "afr_sp": ("空燃比设定",),
+    **{
+        f"{prefix}_{suffix}": (label + reading,)
+        for label, prefix in AUX_EQUIPMENT.items()
+        for suffix, reading in (("temp", "实测"), ("sp", "设定"), ("out", "风阀输出"))
+    },
 }
 STANDARD_KEYS = {
     "gas_flow_instant": "gas",
     "gas_flow_total": "gas_total",
     "air_flow_instant": "air",
+    "air_flow_total": "air_total",
     "o2_meas": "o2",
     "furnace_p_meas": "pressure",
 }
@@ -147,7 +176,12 @@ def infer_mapping(sheets):
             label = str(header).strip().lower()
             stripped = re.sub(r"[（(].*?[）)]", "", label).strip()
             key = next(
-                (k for k, names in FIELD_NAMES.items() if stripped in names or stripped == k), None
+                (
+                    k
+                    for k, names in FIELD_NAMES.items()
+                    if stripped in names or stripped == k or label in (v.lower() for v in names)
+                ),
+                None,
             )
             if not key:
                 match = re.fullmatch(r"z(\d+)_(temp|gas|air)", stripped)
@@ -175,6 +209,63 @@ def infer_mapping(sheets):
         for key, col in old.items()
         if key in FIELD_NAMES or key in STANDARD_KEYS or re.fullmatch(r"z\d+_temp", key)
     ]
+
+
+def sheet_headers(name, rows, standard):
+    if not rows:
+        return [], 0
+    if not standard or name.strip() not in {"温度", "压力"} or len(rows) < 2:
+        return [str(cell or "").strip() for cell in rows[0]], 1
+    parent = ""
+    labels = []
+    for index in range(max(len(rows[0]), len(rows[1]))):
+        top = str(rows[0][index] or "").strip() if index < len(rows[0]) else ""
+        sub = str(rows[1][index] or "").strip() if index < len(rows[1]) else ""
+        if top:
+            parent = top
+        labels.append(" / ".join(dict.fromkeys(filter(None, (parent, sub)))) if sub else top)
+    return labels, 2
+
+
+def source_sheet_preview(data):
+    result = []
+    for sheet, rows in data["sheets"]:
+        labels, start = sheet_headers(sheet, rows, bool(data.get("standard")))
+        count = len(rows) - start
+        indices = sorted(
+            {round(i * (count - 1) / max(1, min(count, 240) - 1)) for i in range(min(count, 240))}
+        )
+        result.append(
+            {
+                "name": sheet,
+                "columns": labels,
+                "count": len(rows) - start,
+                "rows": [rows[start + i][: len(labels)] for i in indices],
+                "rowNumbers": [start + i + 1 for i in indices],
+            }
+        )
+    return result
+
+
+def add_aux_temperatures(standard, sheets):
+    by_time = {r["ts"]: r for r in standard}
+    for sheet, raw in sheets:
+        if sheet.strip() != "温度":
+            continue
+        labels, start = sheet_headers(sheet, raw, True)
+        channels = {}
+        for i, label in enumerate(labels):
+            parent, _, child = label.partition(" / ")
+            prefix = AUX_EQUIPMENT.get(parent)
+            for token, suffix in (("测量", "temp"), ("设定", "sp"), ("风阀输出", "out")):
+                if prefix and token in child:
+                    channels[i] = f"{prefix}_{suffix}"
+        if not channels:
+            continue
+        for cells in raw[start:]:
+            ts = _parse_time(cells[0]) if cells else None
+            if ts and (row := by_time.get(ts.isoformat())) is not None:
+                row.update({k: _to_float(cells[i]) for i, k in channels.items() if i < len(cells)})
 
 
 def parse_file(name: str, blob: bytes, ocr=None):
@@ -217,6 +308,7 @@ def parse_file(name: str, blob: bytes, ocr=None):
                 parsed = parse_upload(PurePosixPath(name).name, blob, "KILN-01")[0]
                 if parsed.status == "ok":
                     standard = [legacy_row(row) for row in parsed.rows]
+                    add_aux_temperatures(standard, sheets)
             mapping = infer_mapping(sheets)
             columns = [
                 {
@@ -224,13 +316,18 @@ def parse_file(name: str, blob: bytes, ocr=None):
                     "label": f"{sheet} · {label}",
                     "sample": str(
                         next(
-                            (row[ci] for row in rows[1:8] if ci < len(row) and row[ci] is not None),
+                            (
+                                row[ci]
+                                for row in rows[start : start + 8]
+                                if ci < len(row) and row[ci] is not None
+                            ),
                             "",
                         )
                     )[:80],
                 }
                 for si, (sheet, rows) in enumerate(sheets)
-                for ci, label in enumerate(rows[0] if rows else [])
+                for labels, start in [sheet_headers(sheet, rows, standard)]
+                for ci, label in enumerate(labels)
                 if str(label or "").strip()
             ]
             manifest.update(
@@ -240,9 +337,9 @@ def parse_file(name: str, blob: bytes, ocr=None):
                 columns=columns,
                 mapping=mapping,
                 standard=bool(standard),
-                rowCount=sum(max(0, len(rows) - 1) for _, rows in sheets),
+                rowCount=sum(len(rows) - sheet_headers(s, rows, standard)[1] for s, rows in sheets),
             )
-            data = {"sheets": sheets, "standard": standard}
+            data = {"sheets": sheets, "standard": standard, "processSchema": 1}
         else:
             chunks = []
             if suffix == ".docx":
@@ -309,7 +406,7 @@ def legacy_row(row):
     out = {
         STANDARD_KEYS.get(k, k): v
         for k, v in row.items()
-        if k in STANDARD_KEYS or k == "temp_sp" or re.fullmatch(r"z\d+_temp", k)
+        if k in STANDARD_KEYS or k in FIELD_NAMES or re.fullmatch(r"z\d+_(temp|air_valve)", k)
     }
     out["ts"] = row["ts"].isoformat()
     for i in range(1, 17):
@@ -317,6 +414,30 @@ def legacy_row(row):
             if row.get(f"z{i}_{old}") is not None:
                 out[f"z{i}_{new}"] = row[f"z{i}_{old}"]
     return out
+
+
+def standard_rows(data):
+    rows = data.get("standard")
+    if not rows:
+        raise ValueError("该文件没有可用的标准双表结果")
+    if data.get("processSchema"):
+        return rows
+    # Older table archives retain the sheets but only a subset of normalized channels.
+    extra = {}
+    for name, raw in data["sheets"]:
+        parser = {"温度": _parse_temp, "压力": _parse_pressure}.get(name.strip())
+        if parser:
+            for ts, record in parser(raw).items():
+                extra.setdefault(ts.isoformat(), {}).update(
+                    {
+                        STANDARD_KEYS.get(k, k): v
+                        for k, v in record.items()
+                        if k in FIELD_NAMES or k == "air_flow_total" or k.endswith("_air_valve")
+                    }
+                )
+    restored = [{**extra.get(row["ts"], {}), **row} for row in rows]
+    add_aux_temperatures(restored, data["sheets"])
+    return restored
 
 
 def parse_timestamp(value):
@@ -333,9 +454,7 @@ def parse_timestamp(value):
 
 def normalize_table(data, mappings, use_standard=False):
     if use_standard:
-        if not data.get("standard"):
-            raise ValueError("该文件没有可用的标准双表结果")
-        return data["standard"], 0
+        return standard_rows(data), 0
     allowed = {x["key"] for x in field_options()}
     if len({m["field"] for m in mappings}) != len(mappings) or len(
         {m["column"] for m in mappings}

@@ -70,6 +70,8 @@ from common.kiln_studio_files import (
     parse_file,
     prepare_cycle,
     safe_members,
+    source_sheet_preview,
+    standard_rows,
 )
 from common.kiln_studio_forecast import preview_temperature_record, run_temperature_forecast
 from common.kiln_studio_grounding import (
@@ -78,7 +80,7 @@ from common.kiln_studio_grounding import (
     ground_selection_refs,
     source_references,
 )
-from common.kiln_studio_observations import zone_observation_trend
+from common.kiln_studio_observations import process_observations, zone_observation_trend
 from common.kiln_studio_replay import build_replay_package
 from common.kiln_studio_schema import (
     AIAlgorithmRecommendation,
@@ -499,6 +501,10 @@ async def execute_job(job_id, owner):
                 result = await _generate_draft(db, owner, job)
             elif operation == "interpret":
                 result = await _interpret_fields(db, owner, job)
+            elif operation == "knowledge_recognition":
+                from api.services.kiln_knowledge import recognize
+
+                result = await recognize(db, owner, job)
             elif operation == "experiment":
                 result = await _experiment(db, owner, job)
             elif operation == "replay":
@@ -506,6 +512,14 @@ async def execute_job(job_id, owner):
             else:
                 raise ValueError("未知后台任务")
             completion = "已完成并保存版本"
+            if operation == "knowledge_recognition":
+                recognition = job.payload["recognition"]
+                completion = (
+                    f"机理识别完成：识别 {recognition['matched']} 条，"
+                    f"新增 {recognition['created']} 条待审核机理"
+                )
+                if recognition.get("sourceCount", 0) < recognition.get("totalSourceCount", 0):
+                    completion += "；本次仅识别部分片段，请分批选择资料继续识别"
             if operation == "parse":
                 project = await get_asset(db, owner, job.project_id, "project")
                 summary = project.payload["archiveSummary"]
@@ -558,7 +572,13 @@ async def _parse_project(db, owner, job):
     from api.services.knowledge.ocr.factory import get_ocr_provider
 
     project = await get_asset(db, owner, job.project_id, "project")
-    previous = {f["path"]: f for f in project.payload.get("files", []) if f["status"] == "ready"}
+    forced = set(job.payload.get("body", {}).get("fileIds", []))
+    previous = {
+        f["path"]: f
+        for f in project.payload.get("files", [])
+        if f["status"] == "ready" and f["id"] not in forced
+    }
+    deleted = set(project.payload.get("deletedPaths", []))
     members = []
     seen = set()
     budget = ArchiveBudget()
@@ -566,6 +586,8 @@ async def _parse_project(db, owner, job):
         blob = _path(owner, upload["key"]).read_bytes()
         extracted = await asyncio.to_thread(list, safe_members(upload["name"], blob, budget=budget))
         for name, data in extracted:
+            if name in deleted:
+                continue
             if name in seen:
                 raise ValueError("存在重复相对路径，请将不同资料放入不同目录")
             seen.add(name)
@@ -582,6 +604,15 @@ async def _parse_project(db, owner, job):
                 return get_ocr_provider().recognize(data)
 
             manifest, data = await asyncio.to_thread(parse_file, name, blob, ocr)
+            manifest["uploadedAt"] = next(
+                (
+                    u.get("uploadedAt") for u in project.payload["uploads"]
+                    if name == PurePosixPath(u["name"]).name
+                    or name.startswith(PurePosixPath(u["name"]).name + "!/")
+                ),
+                None,
+            ) or asset_dict(project)["createdAt"]
+            manifest["parsedAt"] = datetime.now(UTC).isoformat()
             manifest["rawKey"] = write_blob(owner, uid() + ".bin", blob)
             if data:
                 manifest["tableKey"] = write_json(owner, data)
@@ -693,6 +724,7 @@ async def confirm_dataset(db, owner, project_id, body: ConfirmRequest):
     payload = {
         "config": body.model_dump(),
         "dataKey": key,
+        "processSchema": 1,
         "dataHash": content_hash(cycles),
         "summary": summaries,
         "sample": cycles[0]["points"][:8],
@@ -814,6 +846,7 @@ async def import_catalog_candidates(db, owner, project, files, job_id):
                 )
             ).scalars()
         )
+    created = 0
     for public_id in ids:
         if public_id in existing:
             continue
@@ -836,6 +869,8 @@ async def import_catalog_candidates(db, owner, project, files, job_id):
                 "validationStatus": "资料候选，待审核",
             },
         )
+        created += 1
+    return {"created": created, "matched": len(ids), "ids": ids}
 
 
 def _catalog_view(item, dataset, reviewed=(), validated=()):
@@ -1610,21 +1645,49 @@ async def _experiment(db, owner, job):
     return row.public_id
 
 
-async def temperature_observations(db, owner, dataset_id, cycle_id):
+async def table_preview(db, owner, project_id, file_id):
+    project = await get_asset(db, owner, project_id, "project")
+    file = next((f for f in project.payload["files"] if f["id"] == file_id), None)
+    if not file or not file.get("tableKey"):
+        raise AppError(ErrorCode.NOT_FOUND, "该项目没有对应的表格归档", 404)
+    return await asyncio.to_thread(lambda: source_sheet_preview(read_json(owner, file["tableKey"])))
+
+
+async def temperature_observations(db, owner, dataset_id, cycle_id, *, process=False):
     dataset = await get_asset(db, owner, dataset_id, "dataset")
     payload = dataset.payload
     entry = next((row for row in payload["summary"] if row["fileId"] == cycle_id), None)
     if entry is None:
         raise AppError(ErrorCode.VALIDATION, "所选窑次不属于此数据版本", 422)
+    table_key = None
+    if (
+        process
+        and not payload.get("processSchema")
+        and any(
+            f["fileId"] == cycle_id and f.get("useStandard")
+            for f in payload["config"].get("files", [])
+        )
+    ):
+        project = await get_asset(db, owner, dataset.project_id, "project")
+        table_key = next(
+            (f.get("tableKey") for f in project.payload["files"] if f["id"] == cycle_id), None
+        )
 
     def calculate():
         cycles = read_json(owner, payload["dataKey"])
         cycle = next((item for item in cycles if item["id"] == cycle_id), None)
         if cycle is None:
             raise AppError(ErrorCode.VALIDATION, "该窑次的历史记录不可用", 422)
+        points = cycle["points"]
+        if table_key:
+            source = {r["ts"]: r for r in standard_rows(read_json(owner, table_key))}
+            points = [{**source.get(r["ts"], {}), **r} for r in points]
         return {
             "cycleName": entry["file"],
-            **zone_observation_trend(cycle["points"], payload["config"]["zoneCount"]),
+            **({"sourceSupplement": bool(table_key)} if process else {}),
+            **(process_observations if process else zone_observation_trend)(
+                points, payload["config"]["zoneCount"]
+            ),
         }
 
     return await asyncio.to_thread(calculate)
@@ -1958,7 +2021,9 @@ async def _selection_explanations(db, facts, keys):
             return _parse_selection_explanations(raw, facts["candidateOrder"], keys)
 
 
-async def recommend_algorithms(db, owner, project_id, body: AlgorithmRecommendationRequest):
+async def recommend_algorithms(
+    db, owner, project_id, body: AlgorithmRecommendationRequest, *, rules_only: bool = False
+):
     await get_asset(db, owner, project_id, "project")
     dataset = await get_asset(db, owner, body.datasetId, "dataset")
     mech = await get_asset(db, owner, body.mechanismId, "mechanism")
@@ -2201,7 +2266,7 @@ async def recommend_algorithms(db, owner, project_id, body: AlgorithmRecommendat
         "comparableTest": comparable,
         "dataCaveats": caveats,
     }
-    if cards:
+    if cards and not rules_only:
         try:
             ai = await _selection_explanations(db, facts, library.keys())
         except Exception as exc:

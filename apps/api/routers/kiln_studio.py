@@ -1,10 +1,14 @@
 from __future__ import annotations
 
+from pathlib import PurePosixPath
+from urllib.parse import quote
+
 from fastapi import APIRouter, BackgroundTasks, File, Form, Query, UploadFile
 from fastapi.responses import Response
 from pydantic import ValidationError
 
 from api.deps import CurrentUser, DbSession
+from api.services import kiln_knowledge
 from api.services import kiln_studio as service
 from common.errors import AppError, ErrorCode
 from common.kiln_studio_engine import FEATURES
@@ -20,6 +24,7 @@ from common.kiln_studio_schema import (
     ConfirmRequest,
     ConfirmTemperatureRecord,
     DashboardLayoutRequest,
+    DocumentRecognitionRequest,
     ExperimentRequest,
     ExternalAlgorithmImport,
     MechanismComparisonRequest,
@@ -69,6 +74,66 @@ async def demo(user: CurrentUser):
 @router.get("/projects/{project_id}")
 async def project(project_id: str, db: DbSession, user: CurrentUser):
     return ok(await service.project_detail(db, user.id, project_id))
+
+
+@router.post("/projects/{project_id}/files")
+async def append_project_files(
+    project_id: str,
+    db: DbSession,
+    user: CurrentUser,
+    background: BackgroundTasks,
+    files: list[UploadFile] = File(...),  # noqa: B008
+):
+    job = await kiln_knowledge.append_files(db, user.id, project_id, files)
+    background.add_task(service.execute_job, job["id"], user.id)
+    return ok(job)
+
+
+@router.delete("/projects/{project_id}/files/{file_id}")
+async def delete_project_file(project_id: str, file_id: str, db: DbSession, user: CurrentUser):
+    return ok(await kiln_knowledge.delete_file(db, user.id, project_id, file_id))
+
+
+@router.get("/projects/{project_id}/files/{file_id}/download")
+async def download_project_file(project_id: str, file_id: str, db: DbSession, user: CurrentUser):
+    project = await service.get_asset(db, user.id, project_id, "project")
+    file = kiln_knowledge.selected_files(project, [file_id])[0]
+    if not file.get("rawKey"):
+        raise AppError(ErrorCode.NOT_FOUND, "原文件不存在，请重新解析资料", 404)
+    return Response(
+        service._path(user.id, file["rawKey"]).read_bytes(),
+        media_type="application/octet-stream",
+        headers={
+            "Content-Disposition": "attachment; filename*=UTF-8''"
+            + quote(PurePosixPath(file["path"]).name)
+        },
+    )
+
+
+@router.post("/projects/{project_id}/files/{file_id}/reparse")
+async def reparse_project_file(
+    project_id: str,
+    file_id: str,
+    db: DbSession,
+    user: CurrentUser,
+    background: BackgroundTasks,
+):
+    job = await kiln_knowledge.queue_reparse(db, user.id, project_id, file_id)
+    background.add_task(service.execute_job, job["id"], user.id)
+    return ok(job)
+
+
+@router.post("/projects/{project_id}/knowledge/recognize")
+async def recognize_project_documents(
+    project_id: str,
+    body: DocumentRecognitionRequest,
+    db: DbSession,
+    user: CurrentUser,
+    background: BackgroundTasks,
+):
+    job = await kiln_knowledge.queue_recognition(db, user.id, project_id, body)
+    background.add_task(service.execute_job, job["id"], user.id)
+    return ok(job)
 
 
 @router.post("/projects/{project_id}/reparse")
@@ -240,9 +305,15 @@ async def algorithm_availability(
     response_model=ApiResponse[AlgorithmRecommendationResponse],
 )
 async def algorithm_recommendation(
-    project_id: str, body: AlgorithmRecommendationRequest, db: DbSession, user: CurrentUser
+    project_id: str,
+    body: AlgorithmRecommendationRequest,
+    db: DbSession,
+    user: CurrentUser,
+    rules_only: bool = Query(False, alias="rulesOnly"),
 ):
-    return ok(await service.recommend_algorithms(db, user.id, project_id, body))
+    return ok(
+        await service.recommend_algorithms(db, user.id, project_id, body, rules_only=rules_only)
+    )
 
 
 @router.post("/experiments/{experiment_id}/evaluation")
@@ -250,6 +321,20 @@ async def prediction_evaluation(
     experiment_id: str, body: PredictionEvaluationRequest, db: DbSession, user: CurrentUser
 ):
     return ok(await service.prediction_evaluation(db, user.id, experiment_id, body))
+
+
+@router.get("/projects/{project_id}/files/{file_id}/preview")
+async def table_preview(project_id: str, file_id: str, db: DbSession, user: CurrentUser):
+    return ok(await service.table_preview(db, user.id, project_id, file_id))
+
+
+@router.get("/datasets/{dataset_id}/process-observations")
+async def process_observations(
+    dataset_id: str, db: DbSession, user: CurrentUser, cycle_id: str = Query(min_length=1)
+):
+    return ok(
+        await service.temperature_observations(db, user.id, dataset_id, cycle_id, process=True)
+    )
 
 
 @router.get("/datasets/{dataset_id}/temperature-observations")
@@ -357,6 +442,8 @@ async def retry(job_id: str, db: DbSession, user: CurrentUser, background: Backg
     job = await service.get_asset(db, user.id, job_id, "job")
     if job.payload["status"] not in {"failed", "interrupted"}:
         raise AppError(ErrorCode.VALIDATION, "只有失败或中断任务可以重试", 422)
+    if job.payload["operation"] in {"parse", "knowledge_recognition"}:
+        await kiln_knowledge.editable_project(db, user.id, job.project_id)
     await service._job_update(
         db, job, status="queued", progress=0, error=None, message="已重新排队"
     )

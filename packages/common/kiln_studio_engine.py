@@ -200,6 +200,7 @@ PARAMETERS = [
         "过滤停火或过小流量，避免用很小的燃气流量作分母产生失真的配比。",
     ),
 ]
+# 推理复杂度按计算结构定性描述。单点实测耗时优先使用实验保存的试跑数据。
 _ALGORITHM_DEFINITIONS = [
     {
         "key": "lstm",
@@ -213,6 +214,7 @@ _ALGORITHM_DEFINITIONS = [
         "dataRequirements": ["完整历史窗口中的目标读数及可用工况测点"],
         "interpretability": "medium",
         "sampleSizeRisk": "high",
+        "inferenceComplexity": "high",
         "interventionCapable": False,
         "status": "enabled",
         "version": "1",
@@ -231,6 +233,7 @@ _ALGORITHM_DEFINITIONS = [
         "dataRequirements": ["连续的目标测点读数"],
         "interpretability": "high",
         "sampleSizeRisk": "low",
+        "inferenceComplexity": "low",
         "interventionCapable": False,
         "status": "enabled",
         "version": "1",
@@ -250,6 +253,7 @@ _ALGORITHM_DEFINITIONS = [
         "dataRequirements": ["连续目标读数，历史测点和计划越完整越好"],
         "interpretability": "medium",
         "sampleSizeRisk": "medium",
+        "inferenceComplexity": "low",
         "interventionCapable": False,
         "status": "enabled",
         "version": "1",
@@ -269,6 +273,7 @@ _ALGORITHM_DEFINITIONS = [
         "dataRequirements": ["有代表性的多批工况和足够连续的历史测点"],
         "interpretability": "low",
         "sampleSizeRisk": "high",
+        "inferenceComplexity": "medium",
         "interventionCapable": False,
         "status": "enabled",
         "version": "1",
@@ -288,6 +293,7 @@ _ALGORITHM_DEFINITIONS = [
         "dataRequirements": ["任务对应机理已启用，温度和气耗需完整设定计划"],
         "interpretability": "high",
         "sampleSizeRisk": "low",
+        "inferenceComplexity": "low",
         "interventionCapable": True,
         "status": "enabled",
         "version": "1",
@@ -307,6 +313,7 @@ _ALGORITHM_DEFINITIONS = [
         "dataRequirements": ["任务对应机理和可回测历史，每个温度或气耗窗口需完整设定计划"],
         "interpretability": "high",
         "sampleSizeRisk": "medium",
+        "inferenceComplexity": "medium",
         "interventionCapable": True,
         "status": "enabled",
         "version": "1",
@@ -327,6 +334,7 @@ _ALGORITHM_DEFINITIONS = [
         "dataRequirements": ["连续目标读数及稳定的历史测点"],
         "interpretability": "medium",
         "sampleSizeRisk": "medium",
+        "inferenceComplexity": "low",
         "interventionCapable": False,
         "status": "enabled",
         "version": "1",
@@ -417,7 +425,7 @@ FEATURES = [
 ]
 
 
-def examples(cycles, config, min_gas, *, include_sequence=False):
+def examples(cycles, config, min_gas, *, include_sequence=False, include_trajectory=False):
     out = []
     key = target_key(config)
     for cycle in cycles:
@@ -478,8 +486,12 @@ def examples(cycles, config, min_gas, *, include_sequence=False):
                 )
                 if config.task == "temperature" and not config.zone:
                     ex["actualTemperatureSource"] = future.get("tempSource")
-                if include_sequence or "lstm" in (config.selectedAlgorithmKeys or []):
+                if (
+                    include_trajectory or include_sequence
+                    or "lstm" in (config.selectedAlgorithmKeys or [])
+                ):
                     trajectory = []
+                    trajectory_plans = []
                     for offset in range(1, config.horizonMinutes + 1):
                         target = row["time"] + offset
                         position = bisect.bisect_left(times, target, lo=i + 1)
@@ -489,8 +501,14 @@ def examples(cycles, config, min_gas, *, include_sequence=False):
                             else None
                         )
                         trajectory.append(target_value)
+                        trajectory_plans.append(
+                            rows[position].get("temp_sp")
+                            if position < len(rows) and abs(times[position] - target) < 1e-6
+                            else None
+                        )
                     trajectory[-1] = float(y)
                     ex["trajectoryTargets"] = trajectory
+                    ex["trajectoryPlans"] = trajectory_plans
                 out.append(ex)
     return sorted(out, key=lambda x: (x["originTime"], x["cycle"]))
 
@@ -935,6 +953,7 @@ def run_experiment(
         config,
         parameters["minGas"],
         include_sequence=any(item.key == "lstm" for item in (definitions or [])),
+        include_trajectory=config.task == "temperature",
     )
     splits, method = split_examples(samples)
     train, validation, test = splits
@@ -1008,6 +1027,11 @@ def run_experiment(
             pv = predict_many(artifact, validation)
             pt = predict_many(artifact, test)
         if not note:
+            from common.kiln_studio_temperature_path import fit_temperature_heads
+
+            heads = fit_temperature_heads(train, fit_config, p, implementation_key)
+            if heads:
+                artifact["temperatureHeads"] = heads
             calibration_errors = sorted(
                 abs(value - row["y"])
                 for row, value in zip(validation, pv, strict=True)
@@ -1050,7 +1074,11 @@ def run_experiment(
                 "predictionInterval": artifact.get("predictionInterval"),
                 "inferenceBenchmark": inference_benchmark,
                 "predictionOffsets": (
-                    artifact["model"]["offsets"] if key == "lstm" else [config.horizonMinutes]
+                    artifact["model"]["offsets"] if key == "lstm"
+                    else sorted([
+                        *(int(step) for step in artifact.get("temperatureHeads", {})),
+                        config.horizonMinutes,
+                    ])
                 ),
                 "trainingSummary": {
                     key: artifact["model"][key]

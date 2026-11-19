@@ -73,6 +73,37 @@ def test_replay_future_observations_do_not_change_predicted_paths():
     assert first.future["fusion"][29].value == pytest.approx(first.fusionReference[29].value + 2)
 
 
+def test_future_measurement_quality_flags_cannot_remove_known_setpoints():
+    cycles, artifacts, request = example(("ridge", "physics", "fusion"), 5)
+    for artifact in artifacts.values():
+        artifact["config"].update(horizonMinutes=1, excludeZeroTemperatureRecords=True)
+    weights = [0.1] * (len(FEATURES) + 1)
+    artifacts["ridge"]["model"] = weights
+    points = cycles[0]["points"]
+    points[21]["temp_sp"] = 0
+    altered = deepcopy(cycles)
+    altered[0]["points"][21].update(
+        temp=0,
+        z1_temp=0,
+        gas=-9999,
+        air=11,
+        o2=None,
+        pressure=-20,
+    )
+    for row in altered[0]["points"][22:]:
+        row.update(temp=800, z1_temp=750, gas=80, air=8, o2=6, pressure=-20)
+
+    original = build_replay_package(cycles, artifacts, request, 1, origin_after=19)
+    changed = build_replay_package(altered, artifacts, request, 1, origin_after=19)
+    first, revised = original.frames[0], changed.frames[0]
+    assert first.future == revised.future
+    assert first.fusionReference == revised.fusionReference
+    assert first.actualFuture[0].value == 121
+    assert revised.actualFuture[0].value is None
+    assert original.baseSeries[21].setpoint == changed.baseSeries[21].setpoint == 0
+    assert all(point.value is not None for series in first.future.values() for point in series)
+
+
 @pytest.mark.parametrize("window", [5, 10, 30])
 def test_temperature_persistence_outputs_every_minute_independent_of_training_horizon(window):
     cycles, artifacts, request = example(("baseline",), window)

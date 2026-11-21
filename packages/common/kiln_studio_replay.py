@@ -6,9 +6,17 @@ from math import isfinite
 from statistics import median
 from typing import Any
 
-from common.kiln_studio_engine import make_features, physics, predict_model, target_key
+from common.kiln_studio_engine import (
+    algorithm_implementation,
+    make_features,
+    physics,
+    predict_many,
+    predict_model,
+    predict_path,
+    prediction_offsets,
+    target_key,
+)
 from common.kiln_studio_forecast import _advance, _advance_scenario
-from common.kiln_studio_lstm import predict_lstm_path
 from common.kiln_studio_observations import clean_rows as _clean_rows
 from common.kiln_studio_observations import observed
 from common.kiln_studio_schema import ExperimentRequest, ReplayFrame, ReplayPackage, ReplayRequest
@@ -133,8 +141,10 @@ def _independent_mechanism(origin, config, parameters, length, times, plans, max
 
 
 def temperature_trajectory_method(artifact, config):
-    if config.task != "temperature":
+    if config.task not in {"temperature", "energy"}:
         return None
+    if artifact.get("algorithmPackage"):
+        return "fixedHorizon"
     key = artifact.get("implementationKey", artifact["algorithm"])
     if key == "physics":
         return "mechanism"
@@ -143,11 +153,14 @@ def temperature_trajectory_method(artifact, config):
     if config.horizonMinutes == 1:
         return "minuteRecursive"
     if set(range(1, config.horizonMinutes)).issubset(
-        int(step) for step in artifact.get("temperatureHeads", {})
+        int(step) for step in artifact.get("minuteHeads", artifact.get("temperatureHeads", {}))
     ):
         return "multiOutput"
-    if key == "lstm" and set(range(1, config.horizonMinutes + 1)).issubset(
-        artifact["model"].get("offsets") or ()
+    impl = algorithm_implementation(key)
+    if (
+        impl
+        and impl.predict_path
+        and set(range(1, config.horizonMinutes + 1)).issubset(prediction_offsets(artifact))
     ):
         return "multiOutput"
     return "fixedHorizon"
@@ -171,7 +184,7 @@ def _recursive_points(history, held, artifact, config, key, length, times, plans
         available = min(length, int(end - start + _EPSILON))
         value = predict_model(artifact, {"y0": origin[key]})
         return _series(length, dict.fromkeys(range(1, available + 1), value)), None
-    if artifact.get("temperatureHeads"):
+    if artifact.get("minuteHeads") or artifact.get("temperatureHeads"):
         values, virtual = {}, list(history)
         date = datetime.fromisoformat(origin["ts"])
         for segment in range(0, length, config.horizonMinutes):
@@ -193,11 +206,17 @@ def _recursive_points(history, held, artifact, config, key, length, times, plans
             if config.horizonMinutes not in segment_values:
                 break
             # Every head in a segment shares its origin history, never future observations.
-            virtual.extend({
-                **held, key: value, "time": start + segment + step,
-                "ts": (date + timedelta(minutes=segment + step)).isoformat(),
-                "cycle": origin["cycle"], "temp_sp": plan,
-            } for step, (value, plan) in segment_values.items())
+            virtual.extend(
+                {
+                    **held,
+                    key: value,
+                    "time": start + segment + step,
+                    "ts": (date + timedelta(minutes=segment + step)).isoformat(),
+                    "cycle": origin["cycle"],
+                    "temp_sp": plan,
+                }
+                for step, (value, plan) in segment_values.items()
+            )
         return _series(length, values), None
     date = datetime.fromisoformat(origin["ts"])
     native_step = config.horizonMinutes
@@ -205,27 +224,30 @@ def _recursive_points(history, held, artifact, config, key, length, times, plans
     fusion = config.task == "temperature" and implementation == "fusion"
     predictions, reference = {}, {}
     virtual = list(history)
-    lstm = implementation == "lstm"
+    impl = algorithm_implementation(implementation)
+    multi_output = bool(impl and impl.predict_path)
     for segment_start in range(0, length, native_step):
         offset = segment_start + native_step
-        if offset > length and not lstm:
+        if offset > length and not multi_output:
             break
         minute = start + offset
         if minute > times[-1] + _EPSILON:
             break
-        if (lstm or method is not None) and _continuous_end(
+        if (multi_output or method is not None) and _continuous_end(
             times, start + segment_start, minute, max_gap
         ) < minute - _EPSILON:
             break
         setpoint = _plan_at(times, plans, minute, max_gap)
-        features = make_features(virtual, setpoint, config, include_sequence=lstm)
+        features = make_features(
+            virtual, setpoint, config, include_sequence=bool(impl and impl.sequence)
+        )
         if features is None:
             break
-        path = predict_lstm_path(artifact, features) if lstm else {}
-        value = path.get(native_step) if lstm else predict_model(artifact, features)
+        path = predict_path(artifact, features) if multi_output else {}
+        value = path.get(native_step) if multi_output else predict_model(artifact, features)
         if value is None or not isfinite(value):
             break
-        if lstm and config.task in {"energy", "afr"}:
+        if multi_output and config.task in {"energy", "afr"}:
             value = max(0, value)
         if fusion:
             params = artifact["parameters"]
@@ -248,7 +270,7 @@ def _recursive_points(history, held, artifact, config, key, length, times, plans
             value = base[native_step] + (value - anchor_base)
         if not isfinite(value):
             break
-        if lstm:
+        if multi_output:
             for step, intermediate in path.items():
                 elapsed = segment_start + step
                 if step >= native_step or elapsed > length or not isfinite(intermediate):
@@ -398,6 +420,9 @@ def build_replay_package(
     if len(indices) * limit * series_count + actual_count > _MAX_REPLAY_POINTS:
         raise ValueError("回放包太大，请增大帧步长或减少所选算法")
     frames: list[ReplayFrame] = []
+    package_inputs = {
+        artifact["algorithm"]: [] for artifact, _ in selected if artifact.get("algorithmPackage")
+    }
     held: dict[str, float | None] = dict.fromkeys(_HELD_SIGNALS)
     seen = 0
     times_before_gap = times[:excluded_first] if request.excludedRange else times
@@ -426,20 +451,27 @@ def build_replay_package(
             if origin[key] is None:
                 trajectories[name] = _series(limit, {})
             elif temperature_trajectory_method(artifact, model_config) == "mechanism":
-                trajectories[name] = _series(
+                trajectories[name], _ = _independent_mechanism(
+                    origin,
+                    model_config,
+                    artifact["parameters"],
                     limit,
-                    _mechanism_points(
-                        origin[key],
-                        start,
-                        limit,
-                        forecast_times,
-                        plans,
-                        max_gap,
-                        artifact["parameters"]["tauMinutes"],
-                    ),
+                    forecast_times,
+                    plans,
+                    max_gap,
                 )
             elif history_missing:
                 trajectories[name] = _series(limit, {})
+            elif name in package_inputs:
+                trajectories[name] = _series(limit, {})
+                offset = model_config.horizonMinutes
+                end = start + offset
+                if offset > limit or _continuous_end(forecast_times, start, end, max_gap) < end - _EPSILON:
+                    continue
+                setpoint = _plan_at(forecast_times, plans, end, max_gap)
+                features = make_features(history, setpoint, model_config)
+                if features is not None:
+                    package_inputs[name].append((len(frames), features))
             else:
                 trajectories[name], model_reference = _recursive_points(
                     history,
@@ -480,6 +512,14 @@ def build_replay_package(
                 }
             )
         )
+    for artifact, model_config in selected:
+        name = artifact["algorithm"]
+        pending = package_inputs.get(name)
+        if pending:
+            frame_indices, inputs = zip(*pending, strict=True)
+            values = predict_many(artifact, inputs)
+            for frame_index, value in zip(frame_indices, values, strict=True):
+                frames[frame_index].future[name][model_config.horizonMinutes - 1].value = value
     label, unit = {
         "temperature": (f"{config.zone} 区温度" if config.zone else "有效均温", "℃"),
         "energy": ("燃气流量", "Nm³/h"),
@@ -505,7 +545,10 @@ def build_replay_package(
                         else "recursive"
                     ),
                     "trainedHorizonMinutes": cfg.horizonMinutes,
-                    "temperatureTrajectory": temperature_trajectory_method(model, cfg),
+                    "temperatureTrajectory": temperature_trajectory_method(model, cfg)
+                    if cfg.task == "temperature"
+                    else None,
+                    "forecastTrajectory": temperature_trajectory_method(model, cfg),
                 }
                 for model, cfg in selected
             ],

@@ -3,7 +3,7 @@
 from datetime import datetime, timedelta, timezone
 from typing import Annotated, Literal
 
-from pydantic import AwareDatetime, BaseModel, ConfigDict, Field, model_validator
+from pydantic import AwareDatetime, BaseModel, ConfigDict, Field, JsonValue, model_validator
 
 TemplateKey = Literal[
     "energy", "thermal", "combustion", "pressure", "recovery", "carbon", "uniformity", "stages"
@@ -84,6 +84,28 @@ class ExternalAlgorithmMetadata(ExternalAlgorithmSpec):
     probeOutput: float
 
 
+class AlgorithmCapability(Strict):
+    status: Literal["supported", "conditional", "unsupported"]
+    detail: str
+
+
+class AlgorithmCapabilities(Strict):
+    trainingMode: Literal["trainable", "calculated", "frozen"]
+    trainingDetail: str
+    supportedTasks: list[Literal["temperature", "energy", "afr"]]
+    inference: AlgorithmCapability
+    minuteForecast: AlgorithmCapability
+    onnxExport: AlgorithmCapability
+    pythonExport: AlgorithmCapability
+
+
+class AlgorithmPackageRef(Strict):
+    sha256: str = Field(pattern=r"^[0-9a-f]{64}$")
+    image: str = Field(pattern=r"^sha256:[0-9a-f]{64}$")
+    tasks: list[Literal["temperature", "energy", "afr"]] = Field(min_length=1, max_length=3)
+    options: dict[str, str | bool | int | float] = Field(default_factory=dict)
+
+
 class AlgorithmMetadata(Strict):
     key: AlgorithmKey
     name: str
@@ -107,6 +129,10 @@ class AlgorithmMetadata(Strict):
     tuning: AlgorithmTuning | None = None
     parentKey: AlgorithmKey | None = None
     external: ExternalAlgorithmMetadata | None = None
+    package: AlgorithmPackageRef | None = None
+    sourceKind: Literal["builtin", "preset", "external", "package"] | None = None
+    capabilities: AlgorithmCapabilities | None = None
+    parameterSchema: dict[str, JsonValue] | None = None
 
 
 class ColumnMapping(Strict):
@@ -235,6 +261,9 @@ class ExperimentRequest(Strict):
     selectedAlgorithmKeys: list[AlgorithmKey] | None = Field(
         default=None, min_length=1, max_length=32
     )
+    algorithmOptions: dict[AlgorithmKey, dict[str, JsonValue]] = Field(
+        default_factory=dict, max_length=32
+    )
 
     @model_validator(mode="after")
     def unique_selected_algorithms(self):
@@ -335,6 +364,7 @@ class BundleSelection(Strict):
 class BundleRequest(Strict):
     title: str = Field(min_length=1, max_length=160)
     selections: list[BundleSelection] = Field(min_length=1, max_length=3)
+    baseBundleId: str | None = Field(default=None, min_length=1, max_length=32)
 
 
 class SimulateRequest(Strict):
@@ -449,9 +479,12 @@ class ReplayAlgorithm(Strict):
     name: str
     mode: Literal["mechanism", "fusion", "recursive"]
     trainedHorizonMinutes: int
-    temperatureTrajectory: Literal[
-        "mechanism", "persistence", "minuteRecursive", "multiOutput", "fixedHorizon"
-    ] | None = None
+    forecastTrajectory: (
+        Literal["mechanism", "persistence", "minuteRecursive", "multiOutput", "fixedHorizon"] | None
+    ) = None
+    temperatureTrajectory: (
+        Literal["mechanism", "persistence", "minuteRecursive", "multiOutput", "fixedHorizon"] | None
+    ) = None
 
 
 class ReplayPackage(Strict):

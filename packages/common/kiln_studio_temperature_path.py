@@ -19,7 +19,7 @@ def horizon_features(sample, setpoint, minutes):
 def fit_temperature_heads(train, config, parameters, implementation):
     from common.kiln_studio_engine import _fit_fusion, fit_preprocessor, fit_ridge, transform
 
-    if config.task != "temperature" or implementation not in {"ridge", "fusion"}:
+    if config.task not in {"temperature", "energy"} or implementation not in {"ridge", "fusion"}:
         return {}
     heads = {}
     for minute in range(1, config.horizonMinutes):
@@ -56,7 +56,7 @@ def predict_temperature_head(artifact, sample, minute):
 
     if minute == artifact["config"]["horizonMinutes"]:
         return predict_model(artifact, sample)
-    head = artifact.get("temperatureHeads", {}).get(str(minute))
+    head = artifact.get("minuteHeads", artifact.get("temperatureHeads", {})).get(str(minute))
     if head is None:
         return None
     model = {

@@ -5,7 +5,8 @@
 
 from __future__ import annotations
 
-from typing import Any, Iterable
+from collections.abc import Iterable
+from typing import Any
 
 from db.models.user import User
 
@@ -13,6 +14,7 @@ ADMIN_ONLY_MENUS = frozenset(
     {
         "/scene-agents",
         "/model-manage",
+        "/algorithm-manage",
         "/prompt-manage",
         "/mcp-manage",
         "/workflows",
@@ -31,6 +33,7 @@ ALL_MENUS: tuple[str, ...] = (
     "/casting-qa-month",
     "/scene-agents",
     "/model-manage",
+    "/algorithm-manage",
     "/prompt-manage",
     "/mcp-manage",
     "/workflows",
@@ -172,7 +175,7 @@ def _sort_menus(hrefs: Iterable[str]) -> list[str]:
 def sanitize_role_menus(raw: Any) -> list[str]:
     seen: set[str] = set()
     out: list[str] = []
-    if isinstance(raw, (list, tuple)):
+    if isinstance(raw, list | tuple):
         for item in raw:
             href = str(item or "").strip()
             if not href or href in seen:

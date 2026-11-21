@@ -69,6 +69,7 @@ class Settings(BaseSettings):
     jwt_refresh_token_expire_days: int = 7
 
     storage_root: str = "./storage"
+    kiln_algorithm_runner_image: str = ""
 
     # MCP stdio 仓库根（可选）。不设则自动探测 scripts/mcp_utility_server.py 所在根目录。
     # 部署非标准目录结构时可设：ZHONGJI_ROOT=/opt/zhongjiAgent

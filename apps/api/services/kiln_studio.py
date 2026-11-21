@@ -45,6 +45,7 @@ from common.kiln_studio_engine import (
     compare_mechanisms,
     content_hash,
     examples,
+    model_uses_sequence,
     predict_many,
     run_experiment,
     simulate,
@@ -231,7 +232,10 @@ async def project_detail(db, owner, project_id):
     }
 
 
-async def new_job(db, owner, project_id, operation, body, *, algorithm_definitions=None):
+async def new_job(
+    db, owner, project_id, operation, body, *, algorithm_definitions=None,
+    implementation_fingerprints=None, commit=True
+):
     row = await create_asset(
         db,
         owner,
@@ -247,9 +251,11 @@ async def new_job(db, owner, project_id, operation, body, *, algorithm_definitio
             "resultId": None,
             "error": None,
             **({"algorithmDefinitions": algorithm_definitions} if algorithm_definitions else {}),
+            **({"implementationFingerprints": implementation_fingerprints} if implementation_fingerprints else {}),
         },
     )
-    await db.commit()
+    if commit:
+        await db.commit()
     return asset_dict(row)
 
 
@@ -257,12 +263,20 @@ ALGORITHM_PRESET_KIND = "algorithm_preset"
 
 
 def _preset_definition(row):
-    return AlgorithmMetadata.model_validate(row.payload["definition"]).model_copy(
+    from common.kiln_algorithm_capabilities import describe_algorithm
+
+    definition = AlgorithmMetadata.model_validate(row.payload["definition"]).model_copy(
         update={"status": "enabled" if row.payload["enabled"] else "disabled"}
     )
+    return describe_algorithm(definition)
 
 
 async def list_algorithm_catalog(db, owner):
+    from api.services.kiln_algorithm_management import published_definitions
+    from common.kiln_algorithm_release import builtin_keys
+
+    releases = await published_definitions(db, owner)
+    visible_keys = builtin_keys() | {item.key for item in releases}
     rows = (
         (
             await db.execute(
@@ -275,7 +289,9 @@ async def list_algorithm_catalog(db, owner):
         .all()
     )
     custom = [_preset_definition(row) for row in sorted(rows, key=lambda row: row.id, reverse=True)]
-    return [item.model_dump(mode="json") for item in [*algorithm_library(), *custom]]
+    available = [item for item in algorithm_library() if item.key in visible_keys]
+    available.extend(item for item in releases if item.package)
+    return [item.model_dump(mode="json") for item in [*available, *custom]]
 
 
 async def save_algorithm_preset(db, owner, body: AlgorithmPresetRequest):
@@ -306,7 +322,9 @@ async def save_algorithm_preset(db, owner, body: AlgorithmPresetRequest):
         key,
     )
     await db.commit()
-    return definition.model_dump()
+    from common.kiln_algorithm_capabilities import describe_algorithm
+
+    return describe_algorithm(definition).model_dump(mode="json")
 
 
 async def set_algorithm_availability(db, owner, key, enabled):
@@ -377,7 +395,9 @@ async def import_external_algorithm(db, owner, file, body: ExternalAlgorithmImpo
         _path(owner, model_key).unlink(missing_ok=True)
         raise
     await db.commit()
-    return definition
+    from common.kiln_algorithm_capabilities import describe_algorithm
+
+    return describe_algorithm(AlgorithmMetadata.model_validate(definition)).model_dump(mode="json")
 
 
 def _external_model_contents(owner, definitions, config):
@@ -396,9 +416,22 @@ def _external_model_contents(owner, definitions, config):
 
 
 async def selected_algorithm_definitions(db, owner, keys, *, historical=False):
-    builtins = {item.key: item for item in algorithm_library()}
+    if historical:
+        from api.services.kiln_algorithm_management import published_definitions
+
+        builtins = {item.key: item for item in algorithm_library()}
+        builtins.update((item.key, item) for item in await published_definitions(db, owner, historical=True) if item.package)
+    else:
+        builtins = {
+            item["key"]: AlgorithmMetadata.model_validate(item)
+            for item in await list_algorithm_catalog(db, owner)
+        }
     if keys is None:
-        return [item for item in builtins.values() if item.status == "enabled"]
+        return [
+            item
+            for item in builtins.values()
+            if item.status == "enabled" and not item.baseKey and not item.external
+        ]
     selected = []
     for key in keys:
         definition = builtins.get(key)
@@ -507,6 +540,10 @@ async def execute_job(job_id, owner):
                 result = await recognize(db, owner, job)
             elif operation == "experiment":
                 result = await _experiment(db, owner, job)
+            elif operation == "algorithm_validate":
+                from api.services.kiln_algorithm_management import execute_validation
+
+                result = await execute_validation(db, owner, job)
             elif operation == "replay":
                 result = await _replay(db, owner, job)
             else:
@@ -542,6 +579,10 @@ async def execute_job(job_id, owner):
             await db.rollback()
             logger.exception("kiln studio job %s failed", job_id)
             job = await get_asset(db, owner, job_id, "job")
+            if job.payload["operation"] == "algorithm_validate":
+                from api.services.kiln_algorithm_management import fail_validation
+
+                await fail_validation(db, owner, job, str(getattr(exc, "msg", exc)))
             await _job_update(
                 db,
                 job,
@@ -604,14 +645,18 @@ async def _parse_project(db, owner, job):
                 return get_ocr_provider().recognize(data)
 
             manifest, data = await asyncio.to_thread(parse_file, name, blob, ocr)
-            manifest["uploadedAt"] = next(
-                (
-                    u.get("uploadedAt") for u in project.payload["uploads"]
-                    if name == PurePosixPath(u["name"]).name
-                    or name.startswith(PurePosixPath(u["name"]).name + "!/")
-                ),
-                None,
-            ) or asset_dict(project)["createdAt"]
+            manifest["uploadedAt"] = (
+                next(
+                    (
+                        u.get("uploadedAt")
+                        for u in project.payload["uploads"]
+                        if name == PurePosixPath(u["name"]).name
+                        or name.startswith(PurePosixPath(u["name"]).name + "!/")
+                    ),
+                    None,
+                )
+                or asset_dict(project)["createdAt"]
+            )
             manifest["parsedAt"] = datetime.now(UTC).isoformat()
             manifest["rawKey"] = write_blob(owner, uid() + ".bin", blob)
             if data:
@@ -1610,6 +1655,20 @@ async def _experiment(db, owner, job):
         if snapshot
         else await selected_algorithm_definitions(db, owner, config.selectedAlgorithmKeys)
     )
+    # 任务快照固定版本，但新算法必须仍与当前实际执行代码一致。
+    from common.kiln_algorithm_release import builtin_keys, implementation_fingerprint
+
+    for item in definitions:
+        if item.key not in builtin_keys() and not item.baseKey and not item.external:
+            current = item if item.package else next((a for a in algorithm_library() if a.key == item.key), None)
+            expected = job.payload.get("implementationFingerprints", {}).get(item.key)
+            if (
+                current is None
+                or current.version != item.version
+                or not expected
+                or implementation_fingerprint(current) != expected
+            ):
+                raise ValueError("算法实现与排队时的版本不一致，请刷新后重新运行")
     external_models = await asyncio.to_thread(_external_model_contents, owner, definitions, config)
     await _job_update(db, job, progress=25, message="隔离训练/验证/测试窗口；标定并运行所选算法")
     result = await asyncio.to_thread(
@@ -1720,14 +1779,14 @@ async def prediction_evaluation(db, owner, experiment_id, body: PredictionEvalua
             # 旧实验重新读取保存的权重计算完整留出样本，保持原实验的训练与分组口径。
             config = ExperimentRequest.model_validate(payload["config"])
             cycles = read_json(owner, dataset.payload["dataKey"])
+            models = read_json(owner, payload["artifactKey"])
             samples = examples(
                 cycles,
                 config,
                 payload["parameters"]["minGas"],
-                include_sequence=body.algorithm == "lstm",
+                include_sequence=model_uses_sequence(models[body.algorithm]),
             )
             (_, validation, test), _ = split_examples(samples)
-            models = read_json(owner, payload["artifactKey"])
             samples = validation + test
             values = {}
             keys = {body.algorithm} | ({"physics"} if reference else set())
@@ -2151,7 +2210,7 @@ async def recommend_algorithms(
             else external_config_issue(item.external, body)
             if item.external
             else algorithm_unavailable_reason(
-                item.baseKey or item.key, body.task, template_keys, missing_plan
+                item.baseKey or item.key, body.task, template_keys, missing_plan, package=item.package
             )
         )
         if missing_target and not result:
@@ -2313,6 +2372,15 @@ async def recommend_algorithms(
 
 
 async def build_bundle(db, owner, project_id, body):
+    base = (
+        await get_asset(db, owner, body.baseBundleId, "bundle") if body.baseBundleId else None
+    )
+    if base is not None and base.project_id != project_id:
+        raise AppError(ErrorCode.VALIDATION, "基础模型版本不属于当前项目", 422)
+    inherited = {
+        (item["experimentId"], item["algorithm"])
+        for item in (base.payload["manifest"] if base is not None else [])
+    }
     seen = set()
     models, manifest = [], []
     dataset_ids = set()
@@ -2320,12 +2388,17 @@ async def build_bundle(db, owner, project_id, body):
         experiment = await get_asset(db, owner, selection.experimentId, "experiment")
         if experiment.project_id != project_id:
             raise AppError(ErrorCode.VALIDATION, "实验不属于当前项目", 422)
-        await selected_algorithm_definitions(db, owner, [selection.algorithm])
+        dataset_id = experiment.payload["datasetId"]
+        if base is not None and dataset_id != base.payload["datasetId"]:
+            raise AppError(ErrorCode.VALIDATION, "所选实验须使用基础模型版本绑定的数据集", 422)
+        # Inheriting a pinned result does not select its algorithm for a new experiment.
+        if (selection.experimentId, selection.algorithm) not in inherited:
+            await selected_algorithm_definitions(db, owner, [selection.algorithm])
         task = experiment.payload["config"]["task"]
         if task in seen:
             raise AppError(ErrorCode.VALIDATION, "每个任务仅能选择一个实验算法", 422)
         seen.add(task)
-        dataset_ids.add(experiment.payload["datasetId"])
+        dataset_ids.add(dataset_id)
         artifacts = read_json(owner, experiment.payload["artifactKey"])
         model = artifacts.get(selection.algorithm)
         card = next(
@@ -2341,7 +2414,7 @@ async def build_bundle(db, owner, project_id, body):
         ):
             raise AppError(ErrorCode.VALIDATION, "算法不可用或缺少有效回测及训练产物", 422)
         # Load and exercise saved numeric artifacts before reporting a built model.
-        dataset = await get_asset(db, owner, experiment.payload["datasetId"], "dataset")
+        dataset = await get_asset(db, owner, dataset_id, "dataset")
         await asyncio.to_thread(
             simulate, read_json(owner, dataset.payload["dataKey"]), [model], 0.6, 0
         )
@@ -2673,8 +2746,9 @@ async def generate_dashboard_layout(db, owner, bundle_id, body: DashboardLayoutR
             {
                 "role": "system",
                 "content": (
-                    "配置窑炉预测看板。task 只能选可用任务："
-                    "temperature 温度，energy 燃气，afr 空燃比。"
+                    "配置窑炉预测看板。任务包括 temperature 温度，energy 燃气，afr 空燃比。"
+                    "优先根据用户明确要求预测的指标填写 task，即使该任务不在 availableTasks 中。"
+                    "仅当用户未指定预测指标时，才从 availableTasks 中选择。"
                     "缺少时长时，温度选 10 分钟，其他任务选 30 分钟。缺少图形要求时选折线。"
                     "只输出此结构的 JSON："
                     + json.dumps(DashboardLayout.model_json_schema(), ensure_ascii=False)
@@ -2696,21 +2770,56 @@ async def generate_dashboard_layout(db, owner, bundle_id, body: DashboardLayoutR
     except ValueError as exc:
         raise AppError(ErrorCode.INTERNAL, "AI 未返回可用的看板配置，可手动选择", 502) from exc
     if layout.task not in tasks:
-        raise AppError(ErrorCode.VALIDATION, "当前模型组合未包含 AI 选中的预测指标", 422)
+        label = {"temperature": "温度", "energy": "燃气", "afr": "空燃比"}[layout.task]
+        raise AppError(ErrorCode.VALIDATION, f"当前模型版本未包含{label}预测", 422)
     return layout
 
 
-async def export_bundle(db, owner, bundle_id):
+async def export_bundle(db, owner, bundle_id, format="json"):
+    from common.kiln_export_example import build_export_example
+    from common.kiln_model_export import (
+        export_numeric_model,
+        export_python,
+        export_skill,
+        validate_python_models,
+    )
+
+    if format not in {"json", "skill", "python", "onnx"}:
+        raise AppError(ErrorCode.VALIDATION, "不支持的格式，支持 json、skill、python、onnx", 422)
     bundle = await get_asset(db, owner, bundle_id, "bundle")
     dataset = await get_asset(db, owner, bundle.payload["datasetId"], "dataset")
-    return {
-        "format": "kiln-studio-numeric-model-v1",
-        "bundle": asset_dict(bundle),
-        "models": read_json(owner, bundle.payload["artifactKey"]),
-        "datasetConfig": dataset.payload["config"],
-        "engineVersion": "kiln-studio-1.0",
-        "replayInstructions": (
-            "使用 common.kiln_studio_engine.predict_model；输入特征顺序在各模型features内；"
-            "观测仅限预测起点及以前，设定计划是已知输入。"
-        ),
-    }
+    data = export_numeric_model(
+        asset_dict(bundle),
+        read_json(owner, bundle.payload["artifactKey"]),
+        dataset.payload["config"],
+    )
+    if format == "json":
+        return data
+    if format == "skill":
+        return export_skill(data)
+    if format == "onnx":
+        from common.kiln_onnx_export import export_onnx
+
+        cycles = read_json(owner, dataset.payload["dataKey"])
+        return await asyncio.to_thread(export_onnx, data, cycles)
+    validate_python_models(data)
+    cycles = read_json(owner, dataset.payload["dataKey"])
+    example = await asyncio.to_thread(build_export_example, data, cycles)
+    return export_python(data, example)
+
+
+async def export_capabilities(db, owner, bundle_id):
+    from importlib.util import find_spec
+
+    from common.kiln_onnx_graph import validate_models
+
+    data = await export_bundle(db, owner, bundle_id)
+    reason = ""
+    if not find_spec("onnx"):
+        reason = "服务端未安装 ONNX 构图依赖，请安装 onnx-export 可选依赖后重启后端。"
+    else:
+        try:
+            validate_models(data)
+        except AppError as exc:
+            reason = exc.msg
+    return {"onnx": {"available": not reason, "reason": reason, "precision": "FP32"}}

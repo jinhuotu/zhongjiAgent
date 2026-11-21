@@ -17,11 +17,19 @@ from time import perf_counter
 from typing import NamedTuple
 
 import numpy as np
+from pydantic import BaseModel, ValidationError
 
 from common.kiln_studio_evaluation import error_statistics
 from common.kiln_studio_external import external_config_issue, external_predictions
-from common.kiln_studio_lstm import fit_lstm, history_sequence, predict_lstm, predict_lstm_many
+from common.kiln_studio_lstm import (
+    fit_lstm,
+    history_sequence,
+    predict_lstm,
+    predict_lstm_many,
+    predict_lstm_path,
+)
 from common.kiln_studio_observations import clean_rows, observation_quality
+from common.kiln_studio_plugins import install_algorithms
 from common.kiln_studio_schema import AlgorithmMetadata, ExperimentRequest
 
 TEMPLATES = [
@@ -487,7 +495,8 @@ def examples(cycles, config, min_gas, *, include_sequence=False, include_traject
                 if config.task == "temperature" and not config.zone:
                     ex["actualTemperatureSource"] = future.get("tempSource")
                 if (
-                    include_trajectory or include_sequence
+                    include_trajectory
+                    or include_sequence
                     or "lstm" in (config.selectedAlgorithmKeys or [])
                 ):
                     trajectory = []
@@ -809,15 +818,30 @@ def _mechanism_unavailable_reason(task, template_keys, missing_plan):
     return ""
 
 
-class _AlgorithmImplementation(NamedTuple):
+class AlgorithmImplementation(NamedTuple):
     predict: Callable
     fit: Callable | None = None
     unavailable: Callable[[str, list[str], bool], str] | None = None
+    sequence: bool = False
+    predict_many: Callable | None = None
+    predict_path: Callable | None = None
+    parameter_model: type[BaseModel] | None = None
+    tasks: tuple[str, ...] = ("temperature", "energy", "afr")
+
+
+# 保留内部旧名称，避免已有适配器引用失效。
+_AlgorithmImplementation = AlgorithmImplementation
 
 
 # 新增算法接入点：登记训练和预测实现。下架时保留实现，以便重放已保存的模型。
 _IMPLEMENTATIONS = {
-    "lstm": _AlgorithmImplementation(predict_lstm, fit_lstm),
+    "lstm": AlgorithmImplementation(
+        predict_lstm,
+        fit_lstm,
+        sequence=True,
+        predict_many=predict_lstm_many,
+        predict_path=predict_lstm_path,
+    ),
     "baseline": _AlgorithmImplementation(lambda artifact, ex: ex["y0"]),
     "ridge": _AlgorithmImplementation(
         _predict_linear, lambda x, y, config, parameters, train: fit_ridge(x, y, config.ridgeAlpha)
@@ -840,6 +864,7 @@ _IMPLEMENTATIONS = {
 # 算法键也用于历史实验数据点，保留现有曲线字段名。
 ALGORITHMS = tuple(AlgorithmMetadata.model_validate(item) for item in _ALGORITHM_DEFINITIONS)
 _ALGORITHMS_BY_KEY = {item.key: item for item in ALGORITHMS}
+_BUILTIN_KEYS = frozenset(_ALGORITHMS_BY_KEY)
 _POINT_FIELDS = {"ts", "origin", "cycle", "split", "actual", "setpoint", "cumulative"}
 if (
     len(_ALGORITHMS_BY_KEY) != len(ALGORITHMS)
@@ -850,7 +875,150 @@ if (
 
 
 def algorithm_library(*, enabled_only=False):
-    return [item for item in ALGORITHMS if not enabled_only or item.status == "enabled"]
+    from common.kiln_algorithm_capabilities import describe_algorithm
+
+    return [
+        describe_algorithm(item)
+        for item in _ALGORITHMS_BY_KEY.values()
+        if not enabled_only or item.status == "enabled"
+    ]
+
+
+def algorithm_implementation(key):
+    return _IMPLEMENTATIONS.get(key)
+
+
+def model_uses_sequence(artifact):
+    impl = algorithm_implementation(artifact.get("implementationKey", artifact["algorithm"]))
+    return bool(impl and impl.sequence)
+
+
+def register_algorithm(definition, implementation, *, onnx_exporter=None):
+    """仅供受控项目代码在进程启动时注册，不接收页面上传的 Python 代码。"""
+    definition = AlgorithmMetadata.model_validate(definition)
+    key = definition.key
+    if (
+        key in _ALGORITHMS_BY_KEY
+        or key in _POINT_FIELDS
+        or key == "onnx"
+        or key.startswith(("custom_", "package_"))
+    ):
+        raise ValueError(f"算法键 {key} 重复、保留或与资产键冲突")
+    if definition.baseKey or definition.external or not definition.version.strip():
+        raise ValueError("新算法注册须提供独立实现及非空版本")
+    if not isinstance(implementation, AlgorithmImplementation):
+        raise ValueError("算法实现须为 AlgorithmImplementation")
+    callbacks = (
+        implementation.predict,
+        implementation.fit,
+        implementation.unavailable,
+        implementation.predict_many,
+        implementation.predict_path,
+        onnx_exporter,
+    )
+    if not callable(implementation.predict) or any(
+        v is not None and not callable(v) for v in callbacks
+    ):
+        raise ValueError("算法回调不可调用")
+    if not implementation.tasks or set(implementation.tasks) - {"temperature", "energy", "afr"}:
+        raise ValueError("算法支持的预测任务无效")
+    _validate_parameter_schema(implementation.parameter_model)
+    if onnx_exporter is not None:
+        from common.kiln_onnx_graph import register_onnx_converter
+
+        register_onnx_converter(key, onnx_exporter)
+    _IMPLEMENTATIONS[key] = implementation
+    _ALGORITHMS_BY_KEY[key] = definition
+
+
+def _validate_parameter_schema(model):
+    if model is None:
+        return
+    if not isinstance(model, type) or not issubclass(model, BaseModel):
+        raise ValueError("算法参数须使用 Pydantic 模型")
+    if model.model_config.get("extra") != "forbid":
+        raise ValueError("算法参数模型必须禁止未知字段（extra='forbid'）")
+    if any(
+        field.alias or field.validation_alias or field.serialization_alias
+        for field in model.model_fields.values()
+    ):
+        raise ValueError("通用参数契约暂不支持字段别名，请直接使用字段名称")
+    properties = model.model_json_schema().get("properties", {})
+    if any(
+        v.get("type") not in {"number", "integer", "boolean", "string"} for v in properties.values()
+    ):
+        raise ValueError("通用参数编辑器目前支持平铺的数字、整数、布尔及字符串参数")
+
+
+def validate_algorithm_options(config, definitions):
+    """每个算法用自己的 Pydantic 参数模型校验，拒绝未选中项和未知参数。"""
+    library = {item.key: item for item in definitions}
+    if config.algorithmOptions.keys() - library.keys():
+        raise ValueError("算法参数包含未加入当前对比的算法")
+    options = {}
+    for key, definition in library.items():
+        impl = _IMPLEMENTATIONS.get(definition.baseKey or key)
+        values = config.algorithmOptions.get(key, {})
+        parameter_model = impl.parameter_model if impl and not definition.external else None
+        if definition.package:
+            from common.kiln_algorithm_packages import parameter_model as package_options
+
+            parameter_model = package_options(definition.package)
+        if parameter_model is None:
+            if values:
+                raise ValueError(f"算法 {key} 未提供可配置参数契约")
+            continue
+        try:
+            options[key] = parameter_model.model_validate(values).model_dump(mode="json")
+            json.dumps(options[key], allow_nan=False)
+        except (ValidationError, ValueError) as exc:
+            raise ValueError(f"算法 {key} 参数无效：{exc}") from exc
+    return config.model_copy(update={"algorithmOptions": options})
+
+
+def prediction_offsets(artifact):
+    impl = _IMPLEMENTATIONS.get(artifact.get("implementationKey", artifact["algorithm"]))
+    if impl and impl.predict_path:
+        horizon = artifact["config"]["horizonMinutes"]
+        weights = artifact.get("model")
+        offsets = weights.get("offsets", [horizon]) if isinstance(weights, dict) else [horizon]
+        if (
+            not isinstance(offsets, list)
+            or any(type(step) is not int or not 0 < step <= horizon for step in offsets)
+            or sorted(set(offsets)) != offsets
+            or horizon not in offsets
+        ):
+            raise ValueError("多时距输出 offsets 须为升序、不重复的正整数，并包含原生预测时距")
+        return offsets
+    heads = artifact.get("minuteHeads", artifact.get("temperatureHeads", {}))
+    return sorted({*(int(step) for step in heads), artifact["config"]["horizonMinutes"]})
+
+
+def _check_algorithm_version(artifact):
+    key = artifact.get("implementationKey", artifact["algorithm"])
+    definition = _ALGORITHMS_BY_KEY.get(key)
+    if (
+        key not in _BUILTIN_KEYS
+        and definition
+        and artifact.get("algorithmVersion") != definition.version
+    ):
+        raise ValueError(f"算法 {key} 的历史实现版本不匹配，请保留旧键和实现后再回放")
+
+
+def predict_path(artifact, example):
+    _check_algorithm_version(artifact)
+    impl = _IMPLEMENTATIONS.get(artifact.get("implementationKey", artifact["algorithm"]))
+    if not impl or not impl.predict_path:
+        return {}
+    values = impl.predict_path(artifact, example)
+    if not isinstance(values, dict) or any(type(step) is not int for step in values):
+        raise ValueError("多时距推理须返回整数分钟到预测值的映射")
+    allowed = prediction_offsets(artifact)
+    return {
+        minute: max(0, value) if artifact["config"]["task"] in {"energy", "afr"} else value
+        for minute, value in values.items()
+        if minute in allowed and value is not None and math.isfinite(value)
+    }
 
 
 def algorithm_enabled(key):
@@ -858,12 +1026,24 @@ def algorithm_enabled(key):
     return item is not None and item.status == "enabled"
 
 
-def algorithm_unavailable_reason(key, task, template_keys, missing_plan=False):
-    check = _IMPLEMENTATIONS[key].unavailable
+def algorithm_unavailable_reason(key, task, template_keys, missing_plan=False, *, package=None):
+    if package:
+        return "" if task in package.tasks else "算法包不支持当前预测任务"
+    impl = _IMPLEMENTATIONS.get(key)
+    if impl is None:
+        return "算法实现未注册"
+    if task not in impl.tasks:
+        return "算法不支持当前预测任务"
+    check = impl.unavailable
     return check(task, template_keys, missing_plan) if check else ""
 
 
 def predict_model(artifact, ex):
+    if artifact.get("algorithmPackage"):
+        from common.kiln_algorithm_packages import predict_package
+
+        return predict_package(artifact, [ex], each=True)[0]
+    _check_algorithm_version(artifact)
     key = artifact.get("implementationKey", artifact["algorithm"])
     task = artifact["config"]["task"]
     if key == "onnx":
@@ -879,10 +1059,18 @@ def predict_model(artifact, ex):
 
 
 def predict_many(artifact, rows):
+    if artifact.get("algorithmPackage"):
+        from common.kiln_algorithm_packages import predict_package
+
+        return predict_package(artifact, rows)
+    _check_algorithm_version(artifact)
     key = artifact.get("implementationKey", artifact["algorithm"])
-    if key != "lstm":
+    impl = _IMPLEMENTATIONS.get(key)
+    if not impl or not impl.predict_many:
         return [predict_model(artifact, row) for row in rows]
-    values = predict_lstm_many(artifact, rows)
+    values = impl.predict_many(artifact, rows)
+    if len(values) != len(rows):
+        raise ValueError("算法批量输出长度与输入不一致")
     nonnegative = artifact["config"]["task"] in {"energy", "afr"}
     return [
         None
@@ -948,12 +1136,23 @@ def run_experiment(
 ):
     if config.zone and config.task != "temperature":
         raise ValueError("温区选择仅用于温度任务")
+    if definitions is None:
+        library = {item.key: item for item in algorithm_library(enabled_only=True)}
+        requested = config.selectedAlgorithmKeys or [key for key in library if key != "lstm"]
+        if any(key not in library for key in requested):
+            raise ValueError("对比列表中存在不可用的算法")
+        definitions = [library[key] for key in requested]
+    config = validate_algorithm_options(config, definitions)
     samples = examples(
         cycles,
         config,
         parameters["minGas"],
-        include_sequence=any(item.key == "lstm" for item in (definitions or [])),
-        include_trajectory=config.task == "temperature",
+        include_sequence=any(
+            bool(impl and impl.sequence)
+            for item in (definitions or [])
+            for impl in [_IMPLEMENTATIONS.get(item.baseKey or item.key)]
+        ),
+        include_trajectory=config.task in {"temperature", "energy"},
     )
     splits, method = split_examples(samples)
     train, validation, test = splits
@@ -966,12 +1165,6 @@ def run_experiment(
     preds = {}
     missing_plan = any(e["sp0"] is None or e["sp1"] is None for e in samples)
     validation_start = min(example["originTime"] for example in validation + test)
-    if definitions is None:
-        library = {item.key: item for item in algorithm_library(enabled_only=True)}
-        requested = config.selectedAlgorithmKeys or [key for key in library if key != "lstm"]
-        if any(key not in library for key in requested):
-            raise ValueError("对比列表中存在不可用的算法")
-        definitions = [library[key] for key in requested]
     for definition in definitions:
         key = definition.key
         external = definition.external
@@ -981,7 +1174,7 @@ def run_experiment(
             external_config_issue(external, config, validation_start)
             if external
             else algorithm_unavailable_reason(
-                implementation_key, config.task, template_keys, missing_plan
+                implementation_key, config.task, template_keys, missing_plan, package=definition.package
             )
         )
         artifact = {
@@ -1022,8 +1215,19 @@ def run_experiment(
                 except ValueError as exc:
                     note = str(exc)
         elif not note:
-            if implementation and implementation.fit:
+            if definition.package:
+                from common.kiln_algorithm_packages import fit_package
+
+                artifact["algorithmPackage"] = definition.package.model_dump(mode="json")
+                artifact["model"] = fit_package(definition, x, y, fit_config, p, train)
+            elif implementation and implementation.fit:
                 artifact["model"] = implementation.fit(x, y, fit_config, p, train)
+            try:
+                json.dumps(artifact, allow_nan=False)
+            except (TypeError, ValueError) as exc:
+                raise ValueError(
+                    f"算法 {key} 的训练产物必须是有限数值、可 JSON 序列化的对象"
+                ) from exc
             pv = predict_many(artifact, validation)
             pt = predict_many(artifact, test)
         if not note:
@@ -1031,7 +1235,7 @@ def run_experiment(
 
             heads = fit_temperature_heads(train, fit_config, p, implementation_key)
             if heads:
-                artifact["temperatureHeads"] = heads
+                artifact["minuteHeads" if config.task == "energy" else "temperatureHeads"] = heads
             calibration_errors = sorted(
                 abs(value - row["y"])
                 for row, value in zip(validation, pv, strict=True)
@@ -1050,14 +1254,15 @@ def run_experiment(
                 }
             durations = []
             benchmark = test[: min(30, len(test))]
-            for sample in benchmark:
-                started = perf_counter()
-                predict_model(artifact, sample)
-                durations.append((perf_counter() - started) * 1000)
+            if not definition.package:
+                for sample in benchmark:
+                    started = perf_counter()
+                    predict_model(artifact, sample)
+                    durations.append((perf_counter() - started) * 1000)
             started = perf_counter()
             predict_many(artifact, benchmark)
             inference_benchmark = {
-                "environment": "server-cpu",
+                "environment": "container-cpu" if definition.package else "server-cpu",
                 "count": len(benchmark),
                 "maxMs": max(durations, default=None),
                 "meanMs": sum(durations) / len(durations) if durations else None,
@@ -1073,13 +1278,7 @@ def run_experiment(
                 "test": metrics(test, pt, config.task),
                 "predictionInterval": artifact.get("predictionInterval"),
                 "inferenceBenchmark": inference_benchmark,
-                "predictionOffsets": (
-                    artifact["model"]["offsets"] if key == "lstm"
-                    else sorted([
-                        *(int(step) for step in artifact.get("temperatureHeads", {})),
-                        config.horizonMinutes,
-                    ])
-                ),
+                "predictionOffsets": prediction_offsets(artifact),
                 "trainingSummary": {
                     key: artifact["model"][key]
                     for key in (
@@ -1256,13 +1455,13 @@ def simulate(cycles, models, fraction, offset):
                 for row in history
             ]
         ex = make_features(
-            model_history, sp, config, include_sequence=artifact["algorithm"] == "lstm"
+            model_history, sp, config, include_sequence=model_uses_sequence(artifact)
         )
         altered = make_features(
             model_history,
             sp + offset if sp is not None else None,
             config,
-            include_sequence=artifact["algorithm"] == "lstm",
+            include_sequence=model_uses_sequence(artifact),
         )
         if not ex:
             raise ValueError("当前时刻缺少目标值或足够历史窗口")
@@ -1289,3 +1488,7 @@ def simulate(cycles, models, fraction, offset):
             "仅使用起点及以前实测和未来已知设定计划；不读取未来实测特征。各任务独立预测，尚未串联。"
         ),
     }
+
+
+# API 与后台任务均导入此引擎，受控扩展在函数定义完成后统一注册。
+install_algorithms()

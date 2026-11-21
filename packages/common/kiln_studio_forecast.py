@@ -4,7 +4,7 @@ from bisect import bisect_left, bisect_right
 from math import ceil, expm1
 from statistics import median
 
-from common.kiln_studio_engine import make_features, predict_model, target_key
+from common.kiln_studio_engine import make_features, model_uses_sequence, predict_many, predict_model, target_key
 from common.kiln_studio_observations import clean_rows
 from common.kiln_studio_schema import ExperimentRequest, TemperatureForecastRequest
 
@@ -75,7 +75,7 @@ def _alerts(points, series, plan, threshold, duration, max_gap, label):
 
 
 def _rolling_predictions(rows, times, artifact, config, tolerance):
-    forecasts = {}
+    inputs = {}
     for i, origin in enumerate(times):
         target = origin + config.horizonMinutes
         j = bisect_left(times, target, lo=i + 1)
@@ -90,11 +90,13 @@ def _rolling_predictions(rows, times, artifact, config, tolerance):
             rows[start : i + 1],
             rows[j].get("temp_sp"),
             config,
-            include_sequence=artifact["algorithm"] == "lstm",
+            include_sequence=model_uses_sequence(artifact),
         )
         if features is not None:
-            forecasts[j] = predict_model(artifact, features)
-    return forecasts
+            inputs[j] = features
+    if artifact.get("algorithmPackage"):
+        return dict(zip(inputs, predict_many(artifact, list(inputs.values())), strict=True))
+    return {index: predict_model(artifact, example) for index, example in inputs.items()}
 
 
 def preview_temperature_record(points, config: ExperimentRequest, algorithm):
@@ -288,7 +290,7 @@ def run_temperature_forecast(cycle, artifact, request: TemperatureForecastReques
                 rows[: start + 1],
                 rows[j].get("temp_sp"),
                 config,
-                include_sequence=artifact["algorithm"] == "lstm",
+                include_sequence=model_uses_sequence(artifact),
             )
             if features is not None:
                 points[j]["forecast"] = predict_model(artifact, features)

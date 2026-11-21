@@ -304,7 +304,8 @@ def test_flow_and_ratio_use_saved_models_at_native_horizons(task, unit, actual):
         offsets = [
             point.minuteOffset for point in frame.future[algorithm] if point.value is not None
         ]
-        assert offsets == [30, 60]
+        dense_reference = task == "energy" and algorithm in {"physics", "baseline"}
+        assert offsets == (list(range(1, 61)) if dense_reference else [30, 60])
 
 
 def test_afr_replay_uses_model_flow_floor_for_observations_and_origin():

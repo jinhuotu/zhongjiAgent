@@ -257,12 +257,99 @@ async def test_dashboard_layout_matches_saved_bundle_tasks(monkeypatch):
     layout = await kiln_studio.generate_dashboard_layout(db, 7, "bundle", body)
     get_asset.assert_awaited_once_with(db, 7, "bundle", "bundle")
     assert layout.model_dump() == {"task": "energy", "chart": "bar", "windowMinutes": 5}
+    assert "即使该任务不在 availableTasks 中" in complete.call_args.args[0][0]["content"]
     context = json.loads(complete.call_args.args[0][1]["content"])
     assert context == {"availableTasks": ["energy"], "request": body.prompt}
 
     complete.return_value = '{"task":"temperature","chart":"bar","windowMinutes":5}'
-    with pytest.raises(AppError, match="未包含"):
+    with pytest.raises(AppError, match="未包含温度预测"):
         await kiln_studio.generate_dashboard_layout(db, 7, "bundle", body)
+
+
+@pytest.mark.asyncio
+async def test_build_bundle_keeps_pinned_models_and_validates_new_selections(monkeypatch):
+    from api.services import kiln_studio
+    from common.errors import AppError
+    from common.kiln_studio_schema import BundleRequest
+
+    def saved_experiment(public_id, task, key):
+        return SimpleNamespace(
+            public_id=public_id,
+            project_id="p",
+            payload={
+                "config": {"task": task},
+                "datasetId": "d",
+                "artifactKey": public_id,
+                "mechanismId": "m",
+                "mechanismVersion": "1",
+                "unit": task,
+                "algorithms": [
+                    {
+                        "key": key,
+                        "name": key,
+                        "available": True,
+                        "mechanismRole": "",
+                        "test": {"count": 2, "mae": 1},
+                        "validation": {"mae": 1},
+                    }
+                ],
+            },
+        )
+
+    gas = saved_experiment("gas", "energy", "baseline")
+    temp = saved_experiment("temp", "temperature", "ridge")
+    base = SimpleNamespace(
+        project_id="p",
+        payload={
+            "datasetId": "d",
+            "manifest": [{"experimentId": "gas", "algorithm": "baseline"}],
+        },
+    )
+    dataset = SimpleNamespace(public_id="d", payload={"dataKey": "data", "dataHash": "hash"})
+    assets = {"base": base, "gas": gas, "temp": temp, "d": dataset}
+    monkeypatch.setattr(
+        kiln_studio, "get_asset", AsyncMock(side_effect=lambda _, _owner, key, _kind: assets[key])
+    )
+    definitions = AsyncMock()
+    monkeypatch.setattr(kiln_studio, "selected_algorithm_definitions", definitions)
+    simulate = Mock()
+    monkeypatch.setattr(kiln_studio, "simulate", simulate)
+    models = {
+        "gas": {"baseline": {"parameters": {}, "config": gas.payload["config"]}},
+        "temp": {"ridge": {"parameters": {}, "config": temp.payload["config"]}},
+        "data": [],
+    }
+    monkeypatch.setattr(kiln_studio, "read_json", lambda _, key: models[key])
+    monkeypatch.setattr(kiln_studio, "write_json", Mock(return_value="bundle-models"))
+    monkeypatch.setattr(kiln_studio, "create_asset", AsyncMock(side_effect=lambda *args: args[-1]))
+    monkeypatch.setattr(kiln_studio, "asset_dict", lambda asset: asset)
+    body = BundleRequest.model_validate(
+        {
+            "title": "燃气和温度",
+            "baseBundleId": "base",
+            "selections": [
+                {"experimentId": "gas", "algorithm": "baseline"},
+                {"experimentId": "temp", "algorithm": "ridge"},
+            ],
+        }
+    )
+    db = SimpleNamespace(commit=AsyncMock())
+
+    result = await kiln_studio.build_bundle(db, 7, "p", body)
+    assert [(item["task"], item["experimentId"]) for item in result["manifest"]] == [
+        ("energy", "gas"),
+        ("temperature", "temp"),
+    ]
+    definitions.assert_awaited_once_with(db, 7, ["ridge"])
+    assert simulate.call_count == 2
+
+    temp.payload["datasetId"] = "different-dataset"
+    with pytest.raises(AppError, match="基础模型版本绑定的数据集"):
+        await kiln_studio.build_bundle(db, 7, "p", body)
+
+    base.project_id = "different-project"
+    with pytest.raises(AppError, match="基础模型版本不属于当前项目"):
+        await kiln_studio.build_bundle(db, 7, "p", body)
 
 
 def test_temperature_observations_route_only_accepts_cycles_in_the_dataset(monkeypatch):
